@@ -1425,9 +1425,9 @@ void UIRenderer::drawIconScreen(const char *upperMsg, OLEDDisplay *display, OLED
 
     // draw centered icon left to right and centered above the one line of app text
 #if defined(OLED_TINY)
-    display->drawXbm(x + (SCREEN_WIDTH - 50) / 2, y + (SCREEN_HEIGHT - 28) / 2, icon_width, icon_height, icon_bits);
+    display->drawXbm(x + (SCREEN_WIDTH - icon_width) / 2, y + (SCREEN_HEIGHT - icon_height) / 2, icon_width, icon_height, icon_bits);
     if (gBootSplashBoldPass) {
-        display->drawXbm(x + (SCREEN_WIDTH - 50) / 2 + 1, y + (SCREEN_HEIGHT - 28) / 2, icon_width, icon_height, icon_bits);
+        display->drawXbm(x + (SCREEN_WIDTH - icon_width) / 2 + 1, y + (SCREEN_HEIGHT - icon_height) / 2, icon_width, icon_height, icon_bits);
     }
     display->setFont(FONT_MEDIUM);
     display->setTextAlignment(TEXT_ALIGN_LEFT);
@@ -1472,7 +1472,7 @@ void UIRenderer::drawIconScreen(const char *upperMsg, OLEDDisplay *display, OLED
 
     display->setFont(FONT_MEDIUM);
     display->setTextAlignment(TEXT_ALIGN_LEFT);
-    const char *title = "meshtastic.org";
+    const char *title = "MeshROC";
 #if defined(BICOLOR_OLED_DISPLAY)
     additionalYOffset /= 2;
 #else

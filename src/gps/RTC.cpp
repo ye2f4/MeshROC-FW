@@ -13,6 +13,32 @@
 #include <STM32RTC.h>
 #endif
 
+#if defined(INS5699S_RTC)
+// INS5699S is a low-power I2C RTC (Dapu Micro). It has no widely-used Arduino library,
+// so we access its time/date registers directly. Registers 0x00-0x06 hold BCD-encoded
+// seconds/minutes/hours/week/day/month/year (layout similar to PCF8563 but based at 0x00).
+// The seconds register bit7 is the VL (voltage-low / time-invalid) flag.
+static uint8_t ins5699sReadReg(TwoWire &bus, uint8_t reg)
+{
+    bus.beginTransmission((uint8_t)INS5699S_RTC);
+    bus.write(reg);
+    bus.endTransmission(false);
+    bus.requestFrom((uint8_t)INS5699S_RTC, (uint8_t)1);
+    return (uint8_t)bus.read();
+}
+
+static void ins5699sWriteReg(TwoWire &bus, uint8_t reg, uint8_t val)
+{
+    bus.beginTransmission((uint8_t)INS5699S_RTC);
+    bus.write(reg);
+    bus.write(val);
+    bus.endTransmission();
+}
+
+static uint8_t ins5699sBcd2Bin(uint8_t v) { return (uint8_t)((v & 0x0F) + ((v >> 4) & 0x0F) * 10); }
+static uint8_t ins5699sBin2Bcd(uint8_t v) { return (uint8_t)(((v / 10) << 4) | (v % 10)); }
+#endif
+
 static RTCQuality currentQuality = RTCQualityNone;
 uint32_t lastSetFromPhoneNtpOrGps = 0;
 
@@ -221,6 +247,61 @@ RTCSetResult readFromRTC()
             return RTCSetResultSuccess;
         }
     }
+#elif defined(INS5699S_RTC)
+    if (rtc_found.address == INS5699S_RTC) {
+        uint32_t now = millis();
+#if WIRE_INTERFACES_COUNT == 2
+        TwoWire &rtcWire = *ScanI2CTwoWire::fetchI2CBus(rtc_found);
+#else
+        TwoWire &rtcWire = Wire;
+#endif
+        tm t{};
+        uint8_t sec = ins5699sReadReg(rtcWire, 0x00);
+        if (sec & 0x80) {
+            LOG_WARN("INS5699S time invalid (VL flag set)");
+            return RTCSetResultInvalidTime;
+        }
+        t.tm_sec = ins5699sBcd2Bin(sec & 0x7F);
+        t.tm_min = ins5699sBcd2Bin(ins5699sReadReg(rtcWire, 0x01) & 0x7F);
+        uint8_t hr = ins5699sReadReg(rtcWire, 0x02);
+        if (hr & 0x80) { // 12-hour mode
+            uint8_t h12 = ins5699sBcd2Bin(hr & 0x1F);
+            if (hr & 0x40) {
+                h12 += 12;
+            }
+            t.tm_hour = h12 % 24;
+        } else {
+            t.tm_hour = ins5699sBcd2Bin(hr & 0x3F);
+        }
+        t.tm_mday = ins5699sBcd2Bin(ins5699sReadReg(rtcWire, 0x04) & 0x3F);
+        t.tm_mon = ins5699sBcd2Bin(ins5699sReadReg(rtcWire, 0x05) & 0x1F) - 1;
+        // INS5699S has no century bit; assume years 2000-2099.
+        t.tm_year = ins5699sBcd2Bin(ins5699sReadReg(rtcWire, 0x06)) + 100;
+        tv.tv_sec = gm_mktime(&t);
+        tv.tv_usec = 0;
+        uint32_t printableEpoch = tv.tv_sec;
+#ifdef BUILD_EPOCH
+        if (tv.tv_sec < BUILD_EPOCH) {
+            if (Throttle::isWithinTimespanMs(lastTimeValidationWarning, TIME_VALIDATION_WARNING_INTERVAL_MS) == false) {
+                LOG_WARN("Ignore time (%ld) before build epoch (%ld)!", printableEpoch, BUILD_EPOCH);
+                lastTimeValidationWarning = millis();
+            }
+            return RTCSetResultInvalidTime;
+        }
+#endif
+        LOG_DEBUG("Read RTC time from INS5699S as %02d-%02d-%02d %02d:%02d:%02d (%ld)", t.tm_year + 1900, t.tm_mon + 1,
+                  t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, printableEpoch);
+        if (currentQuality == RTCQualityNone) {
+            RTCQuality oldQuality = currentQuality;
+            timeStartMsec = now;
+            zeroOffsetSecs = tv.tv_sec;
+            currentQuality = RTCQualityDevice;
+            onTimeSourceQualityChanged(oldQuality, currentQuality);
+        }
+        return RTCSetResultSuccess;
+    } else {
+        LOG_WARN("RTC not found (found address 0x%02X)", rtc_found.address);
+    }
 #elif HAS_LSE
     if (stm32wlRtcAvailable()) {
         uint32_t now = millis();
@@ -377,6 +458,28 @@ RTCSetResult perhapsSetRTC(RTCQuality q, const struct timeval *tv, bool forceUpd
             } else {
                 LOG_WARN("Failed to set time for RX8130CE");
             }
+        }
+#elif defined(INS5699S_RTC)
+        if (rtc_found.address == INS5699S_RTC) {
+#if WIRE_INTERFACES_COUNT == 2
+            TwoWire &rtcWire = *ScanI2CTwoWire::fetchI2CBus(rtc_found);
+#else
+            TwoWire &rtcWire = Wire;
+#endif
+            time_t setSecs = tv->tv_sec;
+            tm *t = gmtime(&setSecs);
+            // Clear VL flag and force 24h mode when writing seconds/hours.
+            ins5699sWriteReg(rtcWire, 0x00, ins5699sBin2Bcd(t->tm_sec) & 0x7F);
+            ins5699sWriteReg(rtcWire, 0x01, ins5699sBin2Bcd(t->tm_min));
+            ins5699sWriteReg(rtcWire, 0x02, ins5699sBin2Bcd(t->tm_hour) & 0x3F);
+            ins5699sWriteReg(rtcWire, 0x03, ins5699sBin2Bcd(t->tm_wday));
+            ins5699sWriteReg(rtcWire, 0x04, ins5699sBin2Bcd(t->tm_mday));
+            ins5699sWriteReg(rtcWire, 0x05, ins5699sBin2Bcd(t->tm_mon + 1));
+            ins5699sWriteReg(rtcWire, 0x06, ins5699sBin2Bcd(t->tm_year % 100));
+            LOG_DEBUG("INS5699S setDateTime %02d-%02d-%02d %02d:%02d:%02d (%ld)", t->tm_year + 1900, t->tm_mon + 1,
+                      t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec, printableEpoch);
+        } else {
+            LOG_WARN("RTC not found (found address 0x%02X)", rtc_found.address);
         }
 #elif HAS_LSE
         if (stm32wlRtcAvailable()) {

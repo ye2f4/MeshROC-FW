@@ -99,6 +99,9 @@
 #if !MESHTASTIC_EXCLUDE_EXTERNALNOTIFICATION
 #include "modules/ExternalNotificationModule.h"
 #endif
+
+// Mesh-ROC 定制协议模块（datapack.txt）—— 独立封装，不改动原生传输层
+#include "modules/MeshRocModule.h"
 #if !MESHTASTIC_EXCLUDE_RANGETEST && !MESHTASTIC_EXCLUDE_GPS
 #include "modules/RangeTestModule.h"
 #endif
@@ -204,6 +207,9 @@ void setupModules()
 #endif
     // Example: Put your module here
     // new ReplyModule();
+
+    // Mesh-ROC 定制协议模块（datapack.txt）：始终启用，封装 10字节头+TLV+CRC16 帧进私有 portnum
+    meshRocModule = new MeshRocModule();
 #if HAS_SCREEN && !MESHTASTIC_EXCLUDE_CANNEDMESSAGES
     if (config.display.displaymode != meshtastic_Config_DisplayConfig_DisplayMode_COLOR) {
         cannedMessageModule = new CannedMessageModule();

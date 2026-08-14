@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MeshROC 固件 UI 模拟器</title>
+<style>
+  :root {
+    --deepblue: #0F1C2D;
+    --cyan: #22D1C8;
+    --orange: #FF8C29;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 20px;
+    background: #0a0e14;
+    color: #c8d2dc;
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  h1 { font-size: 18px; color: var(--cyan); margin: 0 0 4px; }
+  .sub { font-size: 12px; color: #6b7785; margin-bottom: 18px; }
+  .layout { display: flex; gap: 28px; flex-wrap: wrap; align-items: flex-start; }
+  .panel {
+    background: #11161f; border: 1px solid #1e2733; border-radius: 10px;
+    padding: 16px; min-width: 280px;
+  }
+  .panel h2 { font-size: 13px; color: var(--orange); margin: 0 0 12px; letter-spacing: .5px; }
+  /* 模拟 OLED 屏幕（1bit 单色，发光绿/白像素） */
+  .screen-wrap { background: #000; border-radius: 8px; padding: 14px; display: inline-block; }
+  canvas { image-rendering: pixelated; display: block; background: #000; }
+  .screen-label { font-size: 11px; color: #6b7785; margin-top: 8px; text-align: center; }
+  label { display: block; font-size: 12px; margin: 10px 0 4px; color: #9aa7b4; }
+  select, input[type=range] { width: 100%; }
+  select {
+    background: #0d1219; color: #c8d2dc; border: 1px solid #243040;
+    border-radius: 6px; padding: 6px; font-size: 13px;
+  }
+  .val { color: var(--cyan); font-weight: 600; }
+  .btn-row { display: flex; gap: 8px; margin-top: 14px; }
+  button {
+    flex: 1; background: #16202c; color: var(--cyan); border: 1px solid #243040;
+    border-radius: 6px; padding: 8px; font-size: 12px; cursor: pointer;
+  }
+  button:hover { background: #1d2a39; }
+  button.active { background: var(--cyan); color: #06231f; font-weight: 700; }
+  .note { font-size: 11px; color: #5b6675; margin-top: 14px; line-height: 1.5; }
+  .pill { display:inline-block; background:#0d1219; border:1px solid #243040; border-radius: 10px; padding:1px 8px; font-size:11px; color:#9aa7b4; }
+</style>
+</head>
+<body>
+  <h1>MeshROC 固件 UI 模拟器</h1>
+  <div class="sub">预览刷入固件后设备屏幕的实际呈现 · 单色 OLED 像素级模拟 · 数据来自 <span class="pill">MeshRocModule::drawFrame</span> 与开机 Splash</div>
+
+  <div class="layout">
+    <div class="panel">
+      <h2>设备屏幕预览</h2>
+      <div class="screen-wrap">
+        <canvas id="screen" width="256" height="128"></canvas>
+      </div>
+      <div class="screen-label" id="screenLabel">128×64 OLED · 开机 Splash</div>
+
+      <div class="btn-row">
+        <button id="btnSplash" class="active" onclick="setPage('splash')">开机页</button>
+        <button id="btnInfo" onclick="setPage('info')">MeshROC 信息帧</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>参数调节</h2>
+
+      <label>产品角色（对应官网产品线）</label>
+      <select id="role" onchange="render()">
+        <option value="1">MeshROC Walk（手持终端 · 主力）</option>
+        <option value="0">MeshROC Backbone（山顶太阳能骨干）</option>
+        <option value="2">MeshROC Gateway（POE 城市基站）</option>
+      </select>
+
+      <label>已确认 MeshROC 对端数 (peers)：<span class="val" id="peersVal">3</span></label>
+      <input type="range" id="peers" min="0" max="32" value="3" oninput="peersVal.textContent=this.value; render()">
+
+      <label>原生兼容通道 (nativeCompatEnabled)</label>
+      <select id="compat" onchange="render()">
+        <option value="1">ON（与普通节点互通）</option>
+        <option value="0">OFF（仅私有端口 300）</option>
+      </select>
+
+      <label>设备短名 (short_name)</label>
+      <input id="sname" type="text" value="YE2F4" oninput="render()"
+             style="background:#0d1219;color:#c8d2dc;border:1px solid #243040;border-radius:6px;padding:6px;font-size:13px;width:100%">
+
+      <div class="note">
+        屏幕像素按 1:4 放大渲染（真实屏 128×64，像素颗粒感一致）。<br>
+        固件版本 / GPL-3.0 / 系统名取自 <span class="pill">src/meshroc_brand.h</span>。<br>
+        真实帧绘制见 <span class="pill">MeshRocModule::drawFrame()</span> 与 <span class="pill">UIRenderer::drawIconScreen()</span>。
+      </div>
+    </div>
+  </div>
+
+<script>
+const SCALE = 4;            // 每像素放大倍数
+const W = 128, H = 64;      // 模拟屏幕逻辑分辨率
+const FW_VERSION = "1.0.0"; // 来自 version.properties
+const canvas = document.getElementById('screen');
+const ctx = canvas.getContext('2d');
+canvas.width = W * SCALE;
+canvas.height = H * SCALE;
+
+let currentPage = 'splash';
+
+// 单色像素绘制：亮像素用科技青/白，暗像素黑底
+function px(x, y, on) {
+  if (x < 0 || x >= W || y < 0 || y >= H) return;
+  ctx.fillStyle = on ? '#d6fff8' : '#000000';
+  ctx.fillRect(x * SCALE, y * SCALE, SCALE, SCALE);
+}
+function clearScreen() {
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+}
+
+// 在 (x,y) 处用 5x7 简易字体绘制 ASCII 字符（单色位图字体，呼应固件 FONT_SMALL）
+// 这里用 canvas 文本近似，但加像素化以贴近 OLED 观感
+function text(str, x, y, size = 8, on = true) {
+  ctx.save();
+  ctx.fillStyle = on ? '#d6fff8' : '#000';
+  ctx.font = `${size}px "Courier New", monospace`;
+  ctx.textBaseline = 'top';
+  // 像素化：关闭抗锯齿近似
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillText(str, x * SCALE, y * SCALE);
+  ctx.restore();
+}
+
+// 绘制 MeshROC 圆形 logo（山脊 + 无线电波纹，呼应官网 logo.webp 概念）
+function drawLogo(cx, cy, r, on = true) {
+  ctx.save();
+  ctx.strokeStyle = on ? '#22D1C8' : '#000';
+  ctx.lineWidth = SCALE;
+  // 外圆
+  ctx.beginPath();
+  ctx.arc(cx * SCALE, cy * SCALE, r * SCALE, 0, Math.PI * 2);
+  ctx.stroke();
+  // 山脊（中心三角峰）
+  ctx.beginPath();
+  ctx.moveTo((cx - r*0.7) * SCALE, (cy + r*0.45) * SCALE);
+  ctx.lineTo(cx * SCALE, (cy - r*0.55) * SCALE);
+  ctx.lineTo((cx + r*0.7) * SCALE, (cy + r*0.45) * SCALE);
+  ctx.stroke();
+  // 无线电波纹（右上方弧线）
+  for (let i = 1; i <= 3; i++) {
+    ctx.beginPath();
+    ctx.arc((cx + r*0.55) * SCALE, (cy - r*0.55) * SCALE, i * 2.2 * SCALE, -Math.PI*0.55, -Math.PI*0.05);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function centeredX(str, size, totalW = W) {
+  // 近似字符宽度
+  const cw = size * 0.6;
+  return Math.floor((totalW - str.length * cw) / 2);
+}
+
+function drawSplash() {
+  clearScreen();
+  const sname = document.getElementById('sname').value || "NODE";
+  // 居中 logo（64x32 区域映射到屏中上方）
+  drawLogo(W/2, 18, 13, true);
+  text("MeshROC", centeredX("MeshROC", 10), 36, 10, true);
+  // 底部版本 + short_name
+  const footer = `${FW_VERSION}   ${sname}`;
+  text(footer, centeredX(footer, 8), H - 12, 8, true);
+  document.getElementById('screenLabel').textContent = "128×64 OLED · 开机 Splash";
+}
+
+function drawInfo() {
+  clearScreen();
+  const role = parseInt(document.getElementById('role').value);
+  const peers = parseInt(document.getElementById('peers').value);
+  const compat = document.getElementById('compat').value === "1";
+  const roleName = role === 0 ? "Backbone" : role === 2 ? "Gateway" : "Walk";
+
+  let y = 2;
+  text("MeshROC", 2, y, 9, true); y += 11;
+  text("Mesh Radio-Optimized", 2, y, 7, true); y += 9;
+  text("Communications", 2, y, 7, true); y += 10;
+  text(`FW ${FW_VERSION} | GPL-3.0`, 2, y, 7, true); y += 10;
+  text(`Product: MeshROC ${roleName}`, 2, y, 7, true); y += 10;
+  text(`MeshROC peers: ${peers}`, 2, y, 7, true); y += 10;
+  text(`Compat: ${compat ? "ON" : "OFF"}`, 2, y, 7, true);
+  document.getElementById('screenLabel').textContent = "128×64 OLED · MeshROC 信息帧（drawFrame）";
+}
+
+function render() {
+  if (currentPage === 'splash') drawSplash();
+  else drawInfo();
+}
+
+function setPage(p) {
+  currentPage = p;
+  document.getElementById('btnSplash').classList.toggle('active', p === 'splash');
+  document.getElementById('btnInfo').classList.toggle('active', p === 'info');
+  render();
+}
+
+// 初始化
+render();
+</script>
+</body>
+</html>

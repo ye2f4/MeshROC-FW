@@ -387,6 +387,11 @@ void ScanI2CTwoWire::scanPort(I2CPort port, uint8_t *address, uint8_t asize)
 #ifdef PCF85063_RTC
                 SCAN_SIMPLE_CASE(PCF85063_RTC, RTC_PCF85063, "PCF85063", (uint8_t)addr.address)
 #endif
+#ifdef INS5699S_RTC
+                // NOTE: INS5699S uses I2C address 0x32, identical to RX8130CE_RTC.
+                // Do not enable both on the same board/target.
+                SCAN_SIMPLE_CASE(INS5699S_RTC, RTC_INS5699S, "INS5699S", (uint8_t)addr.address)
+#endif
 
             case CARDKB_ADDR:
                 // Do we have the RAK14006 instead?

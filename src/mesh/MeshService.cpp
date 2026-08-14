@@ -22,6 +22,7 @@
 #include "modules/NodeInfoModule.h"
 #include "modules/PositionModule.h"
 #include "modules/RoutingModule.h"
+#include "modules/MeshRocModule.h" // MeshROC：自动接管文本发送走 sendTextSmart 协商
 #include <assert.h>
 #include <string>
 
@@ -312,7 +313,25 @@ void MeshService::handleToRadio(meshtastic_MeshPacket &p)
     // Send the packet into the mesh
     DEBUG_HEAP_BEFORE;
     auto a = packetPool.allocCopy(p);
-    DEBUG_HEAP_AFTER("MeshService::handleToRadio", a);
+    DEBUG_HEAP_AFTER("MeshService::handleToMesh", a);
+
+    // ---- MeshROC 自动接管：官方 App/CLI 发来的文本消息，改走 sendTextSmart 协商发送 ----
+    // 这样普通节点(未见其发300帧)只收原生端口1、已确认的 MeshROC 节点额外收300增强帧、
+    // 广播双发，实现"刷入即自动混网互通"且零额外配置。
+    // 仅接管 TEXT_MESSAGE_APP 且非发往本机的文本；其它 portnum 走原生路径。
+    if (meshRocModule && meshRocModule->nativeCompatEnabled &&
+        p.decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP &&
+        p.to != nodeDB->getNodeNum() && p.to != 0) {
+        const char *text = (const char *)p.decoded.payload.bytes;
+        uint32_t toNode = (p.to == NODENUM_BROADCAST) ? UINT32_MAX : p.to;
+        LOG_INFO("MeshService: MeshROC auto-relay text (port=%d) to=0x%08x via sendTextSmart", (int)p.decoded.portnum,
+                 p.to);
+        meshRocModule->sendTextSmart(text, toNode);
+        if (a)
+            packetPool.release(a); // sendTextSmart 内部自行分配并发送，释放此拷贝避免泄漏
+        return;
+    }
+
     if (a)
         sendToMesh(a, RX_SRC_USER);
 
