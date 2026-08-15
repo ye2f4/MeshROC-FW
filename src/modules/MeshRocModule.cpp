@@ -153,9 +153,28 @@ uint8_t MeshRocCodec::appendTlv(uint8_t *payload, uint8_t payloadLen, MeshRocTlv
 /* =========================================================================
  * 模块主体
  * ========================================================================= */
-MeshRocModule::MeshRocModule() : SinglePortModule("meshroc", MESHTASTIC_PORTNUM_MESHROC)
+MeshRocModule::MeshRocModule() : SinglePortModule("meshroc", MESHTASTIC_PORTNUM_MESHROC), concurrency::OSThread("MeshRoc")
 {
     logDeploymentWarnings();
+    // RAP 状态初始化（datapack.txt R6）
+    memset(&rapNeighbors, 0, sizeof(rapNeighbors));
+    memset(&rapOwnerTable, 0, sizeof(rapOwnerTable));
+    memset(&rapRemoteOwners, 0, sizeof(rapRemoteOwners));
+    memset(&rapLocal, 0, sizeof(rapLocal));
+    rapLocal.state = RAP_STATE_SCANNING;
+    rapLocal.attachedTo = 0; // 0 = 无归属
+    rapLocal.minDwellUntil = 0;
+    nNeighbors = 0;
+    nOwners = 0;
+    nRemoteOwners = 0;
+    rapTableVersion = 0;
+    rapNextAttachSeq = 1;
+    lastHelloSentAt = 0;
+    helloBackoffPow = 0;
+    lastFullAdvAt = 0;
+    LOG_INFO("MeshRoc: module init (RAP role=%s)", isBackbone() ? "BACKBONE" : "TERMINAL");
+    // 2s 后首跑周期任务，此后由 runOnce 自调度（BACKBONE 按 HELLO 周期，终端按评估间隔）
+    setIntervalFromNow(2000);
 }
 
 /* -------------------------------------------------------------------------
@@ -255,6 +274,11 @@ ProcessMessage MeshRocModule::handleReceived(const meshtastic_MeshPacket &mp)
         break;
     case MESHROC_TYPE_ACK:
         onMeshRocFrame(pkt, payloadLen, mp); // ACK 携带 REVERSE_PATH, 解析并刷新缓存
+        break;
+    case MESHROC_TYPE_RAP:
+        // RAP 路由器归属协议（datapack.txt R1~R12）：不吞包，交由 RAP 状态机处理，
+        // 原版 Meshtastic 节点永不发端口 300 故永不进入此分支，天然走洪泛兜底。
+        onRapPacket(pkt, payloadLen, mp);
         break;
     default:
         onMeshRocFrame(pkt, payloadLen, mp);
@@ -871,6 +895,662 @@ void MeshRocModule::onFloodFrame(const MeshRocPacket &pkt, uint8_t payloadLen)
                 memcpy(m->decoded.payload.bytes, blob, n);
                 service->sendToMesh(m);
             }
+        }
+    }
+}
+
+/* =========================================================================
+ * RAP —— Router Attach Protocol（路由器归属协议，datapack.txt R1~R12）
+ * 双栈：归属表命中且对端可达 → 定向；否则 NextHopRouter 自动落回原版洪泛。
+ * ========================================================================= */
+
+// RAP 载荷内 TLV 查找（首个匹配 tag），未知 tag 必须跳过，前向兼容
+static bool rapTlvFind(const uint8_t *buf, uint8_t len, uint8_t tag, const uint8_t **outVal, uint8_t *outLen)
+{
+    uint8_t off = 0;
+    while (off + 2 <= len) {
+        uint8_t t = buf[off];
+        uint8_t l = buf[off + 1];
+        if (off + 2 + l > len)
+            break;
+        if (t == tag) {
+            *outVal = buf + off + 2;
+            *outLen = l;
+            return true;
+        }
+        off += 2 + l;
+    }
+    return false;
+}
+
+// 构造一个 RAP 帧（ctrl_flag=MESHROC_TYPE_RAP，relayPerm=0，max_hop=0 一跳）
+static MeshRocPacket rapMakeFrame(uint16_t dstShort, uint16_t srcShort, const uint8_t *payload, uint8_t payloadLen,
+                                  bool wantAck)
+{
+    MeshRocPacket pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.ctrl_flag = MeshRocCodec::makeCtrlFlag(MESHROC_TYPE_RAP, MESHROC_PRIO_NORMAL, wantAck, false, false);
+    pkt.src_addr = srcShort;
+    pkt.dst_addr = dstShort; // 0xFFFF = 广播
+    pkt.seq = (uint16_t)(millis() & 0xFFFF);
+    pkt.max_hop = 0; // RAP 仅一跳，禁止中继
+    pkt.snr = 0;
+    pkt.route_mode = 0;
+    if (payload && payloadLen > 0)
+        memcpy(pkt.payload, payload, payloadLen);
+    return pkt;
+}
+
+uint8_t MeshRocModule::localRoleClass() const
+{
+    switch (config.device.role) {
+    case meshtastic_Config_DeviceConfig_Role_ROUTER:
+    case meshtastic_Config_DeviceConfig_Role_ROUTER_LATE:
+        return RAP_ROLE_BACKBONE;
+    case meshtastic_Config_DeviceConfig_Role_SENSOR:
+        return RAP_ROLE_SENSOR;
+    case meshtastic_Config_DeviceConfig_Role_TRACKER:
+        return RAP_ROLE_TRACKER;
+    default:
+        // DTU 用固定供电串口网关，硬件上归类为 CLIENT 但业务密集，按 CLIENT 处理续租
+        return RAP_ROLE_CLIENT;
+    }
+}
+
+uint32_t MeshRocModule::rapTtlForRole(uint8_t role)
+{
+    switch (role) {
+    case RAP_ROLE_SENSOR: return RAP_TTL_SENSOR_MS;
+    case RAP_ROLE_TRACKER: return RAP_TTL_TRACKER_MS;
+    case RAP_ROLE_DTU: return RAP_TTL_DTU_MS;
+    default: return RAP_TTL_CLIENT_MS;
+    }
+}
+
+int8_t MeshRocModule::computeLinkCost(int8_t a, int8_t b) { return min(a, b); }
+
+void MeshRocModule::bumpTableVersion()
+{
+    rapTableVersion++;
+    if (rapTableVersion == 0)
+        rapTableVersion = 1;
+}
+
+RapNeighborEntry *MeshRocModule::findNeighbor(uint32_t bb)
+{
+    for (uint8_t i = 0; i < nNeighbors; i++)
+        if (rapNeighbors[i].backbone == bb)
+            return &rapNeighbors[i];
+    return nullptr;
+}
+
+RapOwnerEntry *MeshRocModule::findOwner(uint32_t node)
+{
+    for (uint8_t i = 0; i < nOwners; i++)
+        if (rapOwnerTable[i].node == node)
+            return &rapOwnerTable[i];
+    return nullptr;
+}
+
+RapOwnerEntry *MeshRocModule::findRemoteOwner(uint32_t node)
+{
+    for (uint8_t i = 0; i < nRemoteOwners; i++)
+        if (rapRemoteOwners[i].node == node)
+            return &rapRemoteOwners[i];
+    return nullptr;
+}
+
+void MeshRocModule::pruneExpiredOwners()
+{
+    uint32_t now = millis();
+    for (uint8_t i = 0; i < nOwners;) {
+        if (rapOwnerTable[i].ttlExpireAt != 0 && now >= rapOwnerTable[i].ttlExpireAt) {
+            LOG_INFO("MeshRoc RAP: owner 0x%08x TTL expired", rapOwnerTable[i].node);
+            for (uint8_t j = i; j + 1 < nOwners; j++)
+                rapOwnerTable[j] = rapOwnerTable[j + 1];
+            nOwners--;
+            bumpTableVersion();
+        } else
+            i++;
+    }
+    for (uint8_t i = 0; i < nRemoteOwners;) {
+        if (rapRemoteOwners[i].ttlExpireAt != 0 && now >= rapRemoteOwners[i].ttlExpireAt) {
+            for (uint8_t j = i; j + 1 < nRemoteOwners; j++)
+                rapRemoteOwners[j] = rapRemoteOwners[j + 1];
+            nRemoteOwners--;
+        } else
+            i++;
+    }
+}
+
+void MeshRocModule::pruneExpiredNeighbors()
+{
+    uint32_t now = millis();
+    for (uint8_t i = 0; i < nNeighbors;) {
+        if (now - rapNeighbors[i].lastHelloAt >= RAP_NEIGHBOR_TTL_MS) {
+            for (uint8_t j = i; j + 1 < nNeighbors; j++)
+                rapNeighbors[j] = rapNeighbors[j + 1];
+            nNeighbors--;
+        } else
+            i++;
+    }
+}
+
+/* ----------------------------- RAP 帧发送 ----------------------------- */
+
+void MeshRocModule::sendRapHello(bool fullAdv)
+{
+    (void)fullAdv; // 增量 HELLO 不携带 owner 摘要（摘要由 OWNERSHIP_ADV 单独通告）
+    uint16_t self = (uint16_t)(nodeDB->getNodeNum() & 0xFFFF);
+    uint8_t payload[16];
+    uint8_t p = 0;
+    payload[p++] = RAP_KIND; payload[p++] = 1; payload[p++] = RAP_HELLO;
+    payload[p++] = RAP_ROLE_CLASS; payload[p++] = 1; payload[p++] = localRoleClass();
+    payload[p++] = RAP_TABLE_VERSION; payload[p++] = 2;
+    payload[p++] = (rapTableVersion >> 8) & 0xFF; payload[p++] = rapTableVersion & 0xFF;
+    payload[p++] = RAP_LINK_COST; payload[p++] = 1; payload[p++] = 0;
+    MeshRocPacket frm = rapMakeFrame(MESHROC_ADDR_INVALID, self, payload, p, false);
+    sendFrame(frm, p, NODENUM_BROADCAST);
+}
+
+void MeshRocModule::sendRapHelloAck(uint32_t dst, int8_t snrToIt)
+{
+    uint16_t self = (uint16_t)(nodeDB->getNodeNum() & 0xFFFF);
+    uint16_t dstShort = (uint16_t)(dst & 0xFFFF);
+    uint8_t payload[16];
+    uint8_t p = 0;
+    payload[p++] = RAP_KIND; payload[p++] = 1; payload[p++] = RAP_HELLO_ACK;
+    payload[p++] = RAP_NEIGHBOR_SNR; payload[p++] = 3;
+    payload[p++] = (dst >> 8) & 0xFF; payload[p++] = dst & 0xFF; payload[p++] = (uint8_t)snrToIt;
+    MeshRocPacket frm = rapMakeFrame(dstShort, self, payload, p, false);
+    sendFrame(frm, p, dst);
+}
+
+void MeshRocModule::sendRapAttachReq(uint32_t backbone)
+{
+    uint16_t self = (uint16_t)(nodeDB->getNodeNum() & 0xFFFF);
+    uint16_t dstShort = (uint16_t)(backbone & 0xFFFF);
+    uint16_t seq = rapNextAttachSeq++;
+    uint8_t payload[16];
+    uint8_t p = 0;
+    payload[p++] = RAP_KIND; payload[p++] = 1; payload[p++] = RAP_ATTACH_REQ;
+    payload[p++] = RAP_ROLE_CLASS; payload[p++] = 1; payload[p++] = localRoleClass();
+    payload[p++] = RAP_ATTACH_SEQ; payload[p++] = 2;
+    payload[p++] = (seq >> 8) & 0xFF; payload[p++] = seq & 0xFF;
+    rapLocal.attachSeq = seq;
+    rapLocal.lastAttachReqAt = millis();
+    MeshRocPacket frm = rapMakeFrame(dstShort, self, payload, p, true);
+    sendFrame(frm, p, backbone);
+}
+
+void MeshRocModule::sendRapAttachAck(uint32_t dst, uint16_t ttlGrant, uint16_t attachSeq)
+{
+    uint16_t self = (uint16_t)(nodeDB->getNodeNum() & 0xFFFF);
+    uint16_t dstShort = (uint16_t)(dst & 0xFFFF);
+    uint8_t payload[16];
+    uint8_t p = 0;
+    payload[p++] = RAP_KIND; payload[p++] = 1; payload[p++] = RAP_ATTACH_ACK;
+    payload[p++] = RAP_TTL_GRANT; payload[p++] = 2;
+    payload[p++] = (ttlGrant >> 8) & 0xFF; payload[p++] = ttlGrant & 0xFF;
+    payload[p++] = RAP_ATTACH_SEQ; payload[p++] = 2;
+    payload[p++] = (attachSeq >> 8) & 0xFF; payload[p++] = attachSeq & 0xFF;
+    MeshRocPacket frm = rapMakeFrame(dstShort, self, payload, p, false);
+    sendFrame(frm, p, dst);
+}
+
+void MeshRocModule::sendRapKeepalive(bool standalone)
+{
+    if (rapLocal.attachedTo == 0)
+        return;
+    uint16_t self = (uint16_t)(nodeDB->getNodeNum() & 0xFFFF);
+    uint16_t dstShort = (uint16_t)(rapLocal.attachedTo & 0xFFFF);
+    uint8_t payload[16];
+    uint8_t p = 0;
+    payload[p++] = RAP_KIND; payload[p++] = 1; payload[p++] = RAP_KEEPALIVE;
+    payload[p++] = RAP_ATTACH_SEQ; payload[p++] = 2;
+    payload[p++] = (rapLocal.attachSeq >> 8) & 0xFF; payload[p++] = rapLocal.attachSeq & 0xFF;
+    if (!standalone) {
+        // 捎带模式：调用方负责把 payload 追加进业务帧（本函数仅发独立帧）
+        return;
+    }
+    MeshRocPacket frm = rapMakeFrame(dstShort, self, payload, p, false);
+    sendFrame(frm, p, rapLocal.attachedTo);
+}
+
+void MeshRocModule::sendRapDetach(uint32_t oldOwner)
+{
+    uint16_t self = (uint16_t)(nodeDB->getNodeNum() & 0xFFFF);
+    uint16_t dstShort = (uint16_t)(oldOwner & 0xFFFF);
+    uint8_t payload[4];
+    uint8_t p = 0;
+    payload[p++] = RAP_KIND; payload[p++] = 1; payload[p++] = RAP_DETACH;
+    MeshRocPacket frm = rapMakeFrame(dstShort, self, payload, p, false);
+    sendFrame(frm, p, oldOwner);
+}
+
+void MeshRocModule::sendRapOwnershipAdv(const RapOwnerEntry *entries, uint8_t count, bool isDelete)
+{
+    uint16_t self = (uint16_t)(nodeDB->getNodeNum() & 0xFFFF);
+    uint8_t payload[MESHROC_MAX_PAYLOAD];
+    uint8_t p = 0;
+    payload[p++] = RAP_KIND; payload[p++] = 1; payload[p++] = RAP_OWNERSHIP_ADV;
+    payload[p++] = RAP_TABLE_VERSION; payload[p++] = 2;
+    payload[p++] = (rapTableVersion >> 8) & 0xFF; payload[p++] = rapTableVersion & 0xFF;
+    uint8_t tlvTag = isDelete ? RAP_OWNER_DEL : RAP_OWNER_LIST;
+    uint8_t entrySize = isDelete ? 2 : 4;
+    payload[p++] = tlvTag; payload[p++] = (uint8_t)(count * entrySize);
+    for (uint8_t i = 0; i < count; i++) {
+        const RapOwnerEntry *e = &entries[i];
+        if (isDelete) {
+            payload[p++] = (e->node >> 8) & 0xFF; payload[p++] = e->node & 0xFF;
+        } else {
+            payload[p++] = (e->node >> 8) & 0xFF; payload[p++] = e->node & 0xFF;
+            payload[p++] = (e->attachSeq >> 8) & 0xFF; payload[p++] = e->attachSeq & 0xFF;
+        }
+    }
+    MeshRocPacket frm = rapMakeFrame(MESHROC_ADDR_INVALID, self, payload, p, false);
+    sendFrame(frm, p, NODENUM_BROADCAST);
+}
+
+void MeshRocModule::sendRapSyncReq(uint32_t dst)
+{
+    uint16_t self = (uint16_t)(nodeDB->getNodeNum() & 0xFFFF);
+    uint16_t dstShort = (uint16_t)(dst & 0xFFFF);
+    uint8_t payload[4];
+    uint8_t p = 0;
+    payload[p++] = RAP_KIND; payload[p++] = 1; payload[p++] = RAP_SYNC_REQ;
+    MeshRocPacket frm = rapMakeFrame(dstShort, self, payload, p, false);
+    sendFrame(frm, p, dst);
+}
+
+/* ----------------------------- RAP 帧接收 ----------------------------- */
+
+void MeshRocModule::onRapPacket(const MeshRocPacket &pkt, uint8_t payloadLen, const meshtastic_MeshPacket &mp)
+{
+    const uint8_t *val = nullptr;
+    uint8_t vlen = 0;
+    if (!rapTlvFind(pkt.payload, payloadLen, RAP_KIND, &val, &vlen) || vlen < 1) {
+        LOG_WARN("MeshRoc RAP: missing RAP_KIND, dropped");
+        return;
+    }
+    uint8_t sub = val[0];
+    uint32_t from = mp.from;
+    switch (sub) {
+    case RAP_HELLO:        onRapHello(pkt, payloadLen, from); break;
+    case RAP_HELLO_ACK:    onRapHelloAck(pkt, payloadLen, from); break;
+    case RAP_ATTACH_REQ:   onRapAttachReq(pkt, payloadLen, from); break;
+    case RAP_ATTACH_ACK:   onRapAttachAck(pkt, payloadLen, from); break;
+    case RAP_KEEPALIVE:    onRapKeepalive(pkt, payloadLen, from); break;
+    case RAP_DETACH:       onRapDetach(pkt, payloadLen, from); break;
+    case RAP_OWNERSHIP_ADV:onRapOwnershipAdv(pkt, payloadLen, from); break;
+    case RAP_SYNC_REQ:     onRapSyncReq(pkt, payloadLen, from); break;
+    default: LOG_WARN("MeshRoc RAP: unknown kind %u", sub); break;
+    }
+}
+
+void MeshRocModule::onRapHello(const MeshRocPacket &pkt, uint8_t payloadLen, uint32_t from)
+{
+    const uint8_t *val, *rval, *vval;
+    uint8_t vl, rl, vvl;
+    uint8_t rclass = RAP_ROLE_CLIENT;
+    if (rapTlvFind(pkt.payload, payloadLen, RAP_ROLE_CLASS, &rval, &rl) && rl >= 1)
+        rclass = rval[0];
+    int8_t snrToIt = getPeerSnr(from); // 我收它的 SNR（handleReceived 已 recordLinkSnr(mp.from)）
+
+    if (isBackbone() && rclass == RAP_ROLE_BACKBONE) {
+        // 骨干互发现：回 HELLO_ACK（定向），准入以回 ACK 为准（排除原版 ROUTER）
+        sendRapHelloAck(from, snrToIt);
+        RapNeighborEntry *nb = findNeighbor(from);
+        if (!nb && nNeighbors < RAP_MAX_NEIGHBORS) {
+            nb = &rapNeighbors[nNeighbors++];
+            memset(nb, 0, sizeof(*nb));
+            nb->backbone = from;
+        }
+        if (nb) {
+            nb->snrMyToIt = snrToIt;
+            nb->lastHelloAt = millis();
+            if (rapTlvFind(pkt.payload, payloadLen, RAP_TABLE_VERSION, &vval, &vvl) && vvl >= 2)
+                nb->tableVersion = ((uint16_t)vval[0] << 8) | vval[1];
+        }
+    } else if (!isBackbone()) {
+        // 终端侧：监听 HELLO 发现归属候选，迟滞切换（铁律三）
+        if (rclass == RAP_ROLE_BACKBONE) {
+            int8_t candSnr = snrToIt;
+            if (rapLocal.state == RAP_STATE_SCANNING || rapLocal.attachedTo == 0) {
+                // 首次听到 → 直接 ATTACH
+                rapLocal.attachedTo = from;
+                rapLocal.state = RAP_STATE_ATTACHED;
+                rapLocal.lastKeepaliveAt = millis();
+                rapLocal.minDwellUntil = millis() + RAP_MIN_DWELL_MS;
+                rapLocal.curSnr = candSnr;
+                sendRapAttachReq(from);
+            } else {
+                if (candSnr >= rapLocal.curSnr + RAP_HYST_SNR_DB) {
+                    rapLocal.hystSamples++;
+                    if (rapLocal.hystSamples >= RAP_HYST_SAMPLES && millis() >= rapLocal.minDwellUntil) {
+                        uint32_t old = rapLocal.attachedTo;
+                        rapLocal.attachedTo = from;
+                        rapLocal.curSnr = candSnr;
+                        rapLocal.hystSamples = 0;
+                        rapLocal.minDwellUntil = millis() + RAP_MIN_DWELL_MS;
+                        sendRapAttachReq(from);
+                        sendRapDetach(old);
+                    }
+                } else {
+                    rapLocal.hystSamples = 0;
+                }
+            }
+            rapLocal.curSnr = max(rapLocal.curSnr, candSnr);
+        }
+    }
+    (void)val;
+}
+
+void MeshRocModule::onRapHelloAck(const MeshRocPacket &pkt, uint8_t payloadLen, uint32_t from)
+{
+    if (!isBackbone())
+        return; // 仅 BACKBONE 处理
+    RapNeighborEntry *nb = findNeighbor(from);
+    if (!nb) {
+        if (nNeighbors < RAP_MAX_NEIGHBORS) {
+            nb = &rapNeighbors[nNeighbors++];
+            memset(nb, 0, sizeof(*nb));
+            nb->backbone = from;
+        } else
+            return;
+    }
+    const uint8_t *val;
+    uint8_t vl;
+    if (rapTlvFind(pkt.payload, payloadLen, RAP_NEIGHBOR_SNR, &val, &vl) && vl >= 3) {
+        nb->snrItToMe = (int8_t)val[2]; // 它回报收我的 SNR
+    }
+    nb->snrMyToIt = getPeerSnr(from);
+    nb->linkCost = computeLinkCost(nb->snrMyToIt, nb->snrItToMe);
+    nb->lastAckAt = millis();
+    nb->acked = true; // 此刻才正式准入（排除原版 ROUTER：它不会回 ACK）
+    helloBackoffPow = 0;
+}
+
+void MeshRocModule::onRapAttachReq(const MeshRocPacket &pkt, uint8_t payloadLen, uint32_t from)
+{
+    if (!isBackbone())
+        return;
+    const uint8_t *sval, *rval;
+    uint8_t sl, rl;
+    uint16_t aseq = 0;
+    uint8_t rclass = RAP_ROLE_CLIENT;
+    if (rapTlvFind(pkt.payload, payloadLen, RAP_ATTACH_SEQ, &sval, &sl) && sl >= 2)
+        aseq = ((uint16_t)sval[0] << 8) | sval[1];
+    if (rapTlvFind(pkt.payload, payloadLen, RAP_ROLE_CLASS, &rval, &rl) && rl >= 1)
+        rclass = rval[0];
+
+    if (nOwners >= RAP_MAX_OWNED) {
+        sendRapAttachAck(from, 0, aseq); // 表满拒绝（TTL_GRANT=0），终端自动退回洪泛
+        LOG_INFO("MeshRoc RAP: ATTACH rejected (table full) from 0x%08x", from);
+        return;
+    }
+    RapOwnerEntry *e = findOwner(from);
+    if (!e) {
+        e = &rapOwnerTable[nOwners++];
+        memset(e, 0, sizeof(*e));
+        e->node = from;
+    }
+    e->ownerBackbone = nodeDB->getNodeNum();
+    e->attachSeq = max(e->attachSeq, aseq);
+    e->roleClass = rclass;
+    e->ttlExpireAt = millis() + rapTtlForRole(rclass);
+    e->failCount = 0;
+
+    bumpTableVersion();
+    sendRapAttachAck(from, (uint16_t)(rapTtlForRole(rclass) / 1000), e->attachSeq);
+    sendRapOwnershipAdv(e, 1, false); // 增量通告单条
+    LOG_INFO("MeshRoc RAP: ATTACH accepted 0x%08x (owned=%u)", from, nOwners);
+}
+
+void MeshRocModule::onRapAttachAck(const MeshRocPacket &pkt, uint8_t payloadLen, uint32_t from)
+{
+    if (isBackbone())
+        return; // 仅终端
+    const uint8_t *tval, *sval;
+    uint8_t tl, sl;
+    uint16_t grantedTtl = 0, aseq = 0;
+    if (rapTlvFind(pkt.payload, payloadLen, RAP_TTL_GRANT, &tval, &tl) && tl >= 2)
+        grantedTtl = ((uint16_t)tval[0] << 8) | tval[1];
+    if (rapTlvFind(pkt.payload, payloadLen, RAP_ATTACH_SEQ, &sval, &sl) && sl >= 2)
+        aseq = ((uint16_t)sval[0] << 8) | sval[1];
+
+    if (grantedTtl == 0) {
+        LOG_INFO("MeshRoc RAP: ATTACH rejected by 0x%08x, fallback flooding", from);
+        rapLocal.state = RAP_STATE_SCANNING;
+        rapLocal.attachedTo = 0;
+        return;
+    }
+    rapLocal.attachedTo = from;
+    rapLocal.attachSeq = aseq;
+    rapLocal.state = RAP_STATE_ATTACHED;
+    rapLocal.lastKeepaliveAt = millis();
+    rapLocal.minDwellUntil = millis() + RAP_MIN_DWELL_MS;
+    rapLocal.curSnr = getPeerSnr(from);
+    rapLocal.hystSamples = 0;
+}
+
+void MeshRocModule::onRapKeepalive(const MeshRocPacket &pkt, uint8_t payloadLen, uint32_t from)
+{
+    if (!isBackbone())
+        return;
+    RapOwnerEntry *e = findOwner(from);
+    if (e) {
+        e->ttlExpireAt = millis() + rapTtlForRole(e->roleClass);
+        // 续租不算变更，表版本不变（避免每次续租触发全网通告）
+    }
+    (void)pkt;
+    (void)payloadLen;
+}
+
+void MeshRocModule::onRapDetach(const MeshRocPacket &pkt, uint8_t payloadLen, uint32_t from)
+{
+    if (!isBackbone())
+        return;
+    RapOwnerEntry *e = findOwner(from);
+    if (e) {
+        uint8_t idx = (uint8_t)(e - rapOwnerTable);
+        for (uint8_t i = idx; i + 1 < nOwners; i++)
+            rapOwnerTable[i] = rapOwnerTable[i + 1];
+        nOwners--;
+        bumpTableVersion();
+        sendRapOwnershipAdv(e, 1, true);
+        LOG_INFO("MeshRoc RAP: DETACH 0x%08x (owned=%u)", from, nOwners);
+    }
+    (void)pkt;
+    (void)payloadLen;
+}
+
+void MeshRocModule::onRapOwnershipAdv(const MeshRocPacket &pkt, uint8_t payloadLen, uint32_t from)
+{
+    if (!isBackbone())
+        return;
+    const uint8_t *vval, *lval, *dval;
+    uint8_t vvl, ll, dl;
+    uint16_t advVer = 0;
+    if (rapTlvFind(pkt.payload, payloadLen, RAP_TABLE_VERSION, &vval, &vvl) && vvl >= 2)
+        advVer = ((uint16_t)vval[0] << 8) | vval[1];
+
+    // 版本号跳变 >1 → 请求全量
+    RapNeighborEntry *nb = findNeighbor(from);
+    uint16_t lastVer = nb ? nb->tableVersion : 0;
+    if (nb)
+        nb->tableVersion = advVer;
+    if (advVer - lastVer > 1) {
+        sendRapSyncReq(from);
+        return;
+    }
+
+    if (rapTlvFind(pkt.payload, payloadLen, RAP_OWNER_LIST, &lval, &ll)) {
+        uint8_t cnt = ll / 4;
+        for (uint8_t i = 0; i < cnt; i++) {
+            const uint8_t *b = lval + i * 4;
+            uint32_t node = ((uint32_t)b[0] << 8) | b[1];
+            uint16_t aseq = ((uint16_t)b[2] << 8) | b[3];
+            RapOwnerEntry *e = findRemoteOwner(node);
+            if (e && e->attachSeq >= aseq)
+                continue; // 已有更新归属，跳过（冲突裁决：attachSeq 大者胜）
+            if (!e && nRemoteOwners < RAP_MAX_REMOTE_OWNERS) {
+                e = &rapRemoteOwners[nRemoteOwners++];
+                memset(e, 0, sizeof(*e));
+                e->node = node;
+            }
+            if (e) {
+                e->ownerBackbone = from;
+                e->attachSeq = aseq;
+                e->ttlExpireAt = millis() + RAP_TTL_CLIENT_MS;
+            }
+        }
+    }
+    if (rapTlvFind(pkt.payload, payloadLen, RAP_OWNER_DEL, &dval, &dl)) {
+        uint8_t cnt = dl / 2;
+        for (uint8_t i = 0; i < cnt; i++) {
+            const uint8_t *b = dval + i * 2;
+            uint32_t node = ((uint32_t)b[0] << 8) | b[1];
+            RapOwnerEntry *e = findRemoteOwner(node);
+            if (e) {
+                uint8_t idx = (uint8_t)(e - rapRemoteOwners);
+                for (uint8_t j = idx; j + 1 < nRemoteOwners; j++)
+                    rapRemoteOwners[j] = rapRemoteOwners[j + 1];
+                nRemoteOwners--;
+            }
+        }
+    }
+}
+
+void MeshRocModule::onRapSyncReq(const MeshRocPacket &pkt, uint8_t payloadLen, uint32_t from)
+{
+    if (!isBackbone())
+        return;
+    LOG_INFO("MeshRoc RAP: SYNC_REQ from 0x%08x, full adv (%u entries)", from, nOwners);
+    for (uint8_t i = 0; i < nOwners; i += RAP_ADV_MAX_ENTRIES_PER_FRAME) {
+        uint8_t cnt = min((uint8_t)(nOwners - i), (uint8_t)RAP_ADV_MAX_ENTRIES_PER_FRAME);
+        sendRapOwnershipAdv(&rapOwnerTable[i], cnt, false); // 分片全量
+    }
+    (void)pkt;
+    (void)payloadLen;
+}
+
+/* ----------------------------- RAP 周期任务（OSThread runOnce） ----------------------------- */
+
+int32_t MeshRocModule::runOnce()
+{
+    uint32_t now = millis();
+
+    if (isBackbone()) {
+        // 过期回收
+        pruneExpiredOwners();
+        pruneExpiredNeighbors();
+
+        // 指数退避：连续未收到 HELLO_ACK 时放大周期；收到 ACK 复位（见 onRapHelloAck）
+        uint32_t period = RAP_HELLO_PERIOD_MS;
+        if (helloBackoffPow > 0)
+            period = min((uint32_t)RAP_HELLO_PERIOD_MS << helloBackoffPow, RAP_MAX_HELLO_BACKOFF_MS);
+
+        bool due = (now - lastHelloSentAt) >= period;
+        bool lbtOk = (airTime->channelUtilizationPercent() < RAP_LBT_UTIL_THRESHOLD_PCT); // 发射前信道侦听
+        if (due && lbtOk) {
+            sendRapHello(false);
+            lastHelloSentAt = now;
+            helloBackoffPow = 0;
+        } else if (due && !lbtOk) {
+            LOG_INFO("MeshRoc RAP: HELLO deferred by LBT (util=%u%%)",
+                     (unsigned)airTime->channelUtilizationPercent());
+        }
+
+        // 低频全量通告（软状态收敛），分片每片 ≤16 条
+        if ((now - lastFullAdvAt) >= RAP_FULL_ADV_PERIOD_MS) {
+            lastFullAdvAt = now;
+            if (nOwners > 0) {
+                for (uint8_t i = 0; i < nOwners; i += RAP_ADV_MAX_ENTRIES_PER_FRAME) {
+                    uint8_t cnt = min((uint8_t)(nOwners - i), (uint8_t)RAP_ADV_MAX_ENTRIES_PER_FRAME);
+                    sendRapOwnershipAdv(&rapOwnerTable[i], cnt, false);
+                }
+            }
+        }
+        return RAP_HELLO_PERIOD_MS / 4; // 每 1/4 周期扫一次过期/调度
+    } else {
+        // 终端：续租 + 评估切换
+        if (rapLocal.state == RAP_STATE_ATTACHED && rapLocal.attachedTo != 0) {
+            uint32_t kaPeriod = (localRoleClass() == RAP_ROLE_SENSOR) ? RAP_KEEPALIVE_SENSOR_MS
+                                                                      : RAP_KEEPALIVE_CLIENT_MS;
+            if ((now - rapLocal.lastKeepaliveAt) >= kaPeriod) {
+                sendRapKeepalive(true); // 独立 Keepalive 帧（SENSOR 由遥测捎带在别处）
+                rapLocal.lastKeepaliveAt = now;
+            }
+        }
+        // 评估（迟滞采样）由 onRapHello 持续累积，这里仅维持调度节奏
+        return RAP_EVAL_INTERVAL_MS;
+    }
+}
+
+/* ----------------------------- RAP 双栈公开接口（NextHopRouter 调用） ----------------------------- */
+
+std::optional<uint8_t> MeshRocModule::getRapNextHop(uint32_t to)
+{
+    if (!isBackbone())
+        return std::nullopt; // 终端不做定向转发
+    if (isBroadcast(to) || to == 0)
+        return std::nullopt;
+
+    // 归属查表：先本机下属，再邻居通告的远程归属
+    uint32_t ownerBb = 0;
+    RapOwnerEntry *e = findOwner(to);
+    if (e && e->ttlExpireAt != 0 && (uint32_t)millis() < e->ttlExpireAt) {
+        ownerBb = e->ownerBackbone;
+    } else {
+        RapOwnerEntry *re = findRemoteOwner(to);
+        if (re && re->ttlExpireAt != 0 && (uint32_t)millis() < re->ttlExpireAt)
+            ownerBb = re->ownerBackbone;
+    }
+    if (ownerBb == 0)
+        return std::nullopt; // 未命中 → 落回洪泛
+
+    // 归属 BACKBONE 必须可达（在 rapNeighbors 内、已 ack、未过期 Hello）
+    RapNeighborEntry *nb = findNeighbor(ownerBb);
+    if (!nb || !nb->acked)
+        return std::nullopt;
+    if ((uint32_t)millis() - nb->lastHelloAt >= RAP_NEIGHBOR_TTL_MS)
+        return std::nullopt; // 邻居过期 → 落回洪泛
+
+    // 降级为末字节并做唯一性解析，规避 NodeInfoLite.next_hop 的 uint8_t 末字节撞车
+    uint8_t lastByte = (uint8_t)(ownerBb & 0xFF);
+    uint32_t resolved = 0;
+    if (nodeDB->resolveUniqueLastByte(lastByte, true, &resolved) && resolved == ownerBb)
+        return lastByte; // 唯一匹配且确为归属 BACKBONE
+    return std::nullopt; // 末字节撞车/不唯一 → 不冒险定向，落回洪泛
+}
+
+void MeshRocModule::noteRapRouteFailure(uint32_t toNode)
+{
+    if (!isBackbone())
+        return;
+    RapOwnerEntry *e = findOwner(toNode);
+    if (e) {
+        e->failCount++;
+        if (e->failCount >= RAP_ROUTE_FAIL_THRESHOLD) {
+            uint8_t idx = (uint8_t)(e - rapOwnerTable);
+            for (uint8_t j = idx; j + 1 < nOwners; j++)
+                rapOwnerTable[j] = rapOwnerTable[j + 1];
+            nOwners--;
+            bumpTableVersion();
+            LOG_INFO("MeshRoc RAP: owner 0x%08x route fail, dropped (flood fallback)", toNode);
+        }
+        return;
+    }
+    RapOwnerEntry *re = findRemoteOwner(toNode);
+    if (re) {
+        re->failCount++;
+        if (re->failCount >= RAP_ROUTE_FAIL_THRESHOLD) {
+            uint8_t idx = (uint8_t)(re - rapRemoteOwners);
+            for (uint8_t j = idx; j + 1 < nRemoteOwners; j++)
+                rapRemoteOwners[j] = rapRemoteOwners[j + 1];
+            nRemoteOwners--;
+            LOG_INFO("MeshRoc RAP: remote owner 0x%08x route fail, dropped", toNode);
         }
     }
 }

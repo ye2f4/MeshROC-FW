@@ -44,6 +44,16 @@ src/mesh/raspihttp/private_key.pem
 # Ignore logo (set at build time with platformio-custom.py)
 data/boot/logo.*
 
+# Local build / debug artifacts (not part of the repo)
+build_heltec.log
+*_out.txt
+uvwrap.cs
+uv_call.log
+meshtestic/
+
+# Local project data (not part of the repo)
+.codebuddy/
+
 # pioarduino platform
 managed_components/*
 arduino-lib-builder*

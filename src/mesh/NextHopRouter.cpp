@@ -9,6 +9,7 @@
 #include "modules/TrafficManagementModule.h"
 #endif
 #include "NodeDB.h"
+#include "modules/MeshRocModule.h"
 
 #if USERPREFS_EVENT_MODE
 static void capEventRelayHops(meshtastic_MeshPacket *packet)
@@ -187,7 +188,17 @@ void NextHopRouter::sniffReceived(const meshtastic_MeshPacket *p, const meshtast
     Router::sniffReceived(p, c);
 }
 
-/* Check if we should be rebroadcasting this packet if so, do so. */
+/* Check if we should be rebroadcasting this packet if so, do so.
+ *
+ * RAP DUAL-STACK HARD RULE (route.txt §10.2):
+ *   Do NOT add any early-return / suppression here on the first-relay path.
+ *   RAP only削减 redundant duplicate rebroadcasts via the existing
+ *   perhapsCancelDupe path. If a MeshROC node silently swallowed a packet
+ *   from a native Meshtastic device without relaying it, that would create a
+ *   SILENT NETWORK HOLE (native devices have no NACK to detect the drop).
+ *   RAP's directed delivery is injected ONLY in getNextHop(); this function
+ *   must stay byte-for-byte equivalent to native Meshtastic.
+ */
 bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
 {
     // Check if traffic management wants to exhaust this packet's hops
@@ -256,6 +267,23 @@ std::optional<uint8_t> NextHopRouter::getNextHop(NodeNum to, uint8_t relay_node)
 {
     if (isBroadcast(to))
         return std::nullopt;
+
+    // --- RAP dual-stack injection (route.txt §10.1) ---
+    // RAP provides a directed hop ONLY when the destination's owning BACKBONE is
+    // known and reachable; otherwise it must fall through to native flooding.
+    // This is the SINGLE injection point — FloodingRouter::perhapsRebroadcast is
+    // left byte-for-byte original (HARD RULE §10.2: never suppress first relay).
+    // meshRocModule is a global singleton; it returns a UNIQUE last byte (already
+    // passed through resolveUniqueLastByte) or nullopt to fall back to flooding.
+    // We only take the RAP path on ROUTER (BACKBONE) nodes, where ownership tables
+    // are maintained; terminals never originate directed RAP hops here.
+    if (config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER && meshRocModule) {
+        auto rapHop = meshRocModule->getRapNextHop(to);
+        if (rapHop.has_value()) {
+            LOG_DEBUG("RAP directed next_hop 0x%x for 0x%08x", *rapHop, to);
+            return *rapHop;
+        }
+    }
 
     // Hot store first: a direct array hit on the live NodeDB entry.
     meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(to);
@@ -580,6 +608,12 @@ void NextHopRouter::noteRouteSuccess(NodeNum dest, uint32_t now)
 
 void NextHopRouter::noteRouteFailure(NodeNum dest)
 {
+    // RAP dual-stack (route.txt §10.3): feed directed-delivery failures into RAP's
+    // owner table so a dead owning BACKBONE gets dropped and the next packet falls
+    // back to flooding automatically (RAP_ROUTE_FAIL_THRESHOLD = 3 consecutive).
+    if (meshRocModule)
+        meshRocModule->noteRapRouteFailure(dest);
+
     RouteHealth *h = findRouteHealth(dest);
     if (!h)
         return; // nothing to penalize (we were flooding, or never learned a route here)
