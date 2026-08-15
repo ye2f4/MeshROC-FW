@@ -51,6 +51,9 @@ uvwrap.cs
 uv_call.log
 meshtestic/
 
+# Local project data (not part of the repo)
+.codebuddy/
+
 # pioarduino platform
 managed_components/*
 arduino-lib-builder*
