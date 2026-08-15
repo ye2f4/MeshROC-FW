@@ -53,7 +53,70 @@ typedef enum {
     MESHROC_TYPE_TELEMETRY   = 4, // 传感器遥测包
     MESHROC_TYPE_HEARTBEAT   = 5, // 节点心跳包
     MESHROC_TYPE_ENCRYPTED   = 6, // 加密传输帧
+    MESHROC_TYPE_RAP         = 7, // RAP 控制族（路由器归属协议，真实子类型见载荷首个 TLV 0x20 RAP_KIND）
 } MeshRocPacketType;
+
+// RAP 子类型（RAP_KIND 的 value，1 字节；datapack.txt R3）
+typedef enum {
+    RAP_HELLO = 1,        // BACKBONE 周期广播：我在，我是骨干
+    RAP_HELLO_ACK = 2,    // BACKBONE 定向回应：我也在 + 我收你的 SNR
+    RAP_ATTACH_REQ = 3,   // 终端请求归属到某 BACKBONE
+    RAP_ATTACH_ACK = 4,   // BACKBONE 接受归属 + 下发续租 TTL
+    RAP_KEEPALIVE = 5,    // 终端续租（可捎带在遥测/位置帧内）
+    RAP_DETACH = 6,       // 终端主动注销（加速回收，非必需）
+    RAP_OWNERSHIP_ADV = 7,// BACKBONE 向邻居通告归属变更（增量/全量 Delta）
+    RAP_SYNC_REQ = 8,     // 请求对端全量重发归属表（版本号不连续时）
+} RapKind;
+
+// RAP 专用 TLV（0x20~0x2F 区间，与既有 0x01-0x13 不冲突；datapack.txt R4）
+typedef enum {
+    RAP_KIND = 0x20,            // len=1   value=子类型（见 RapKind）
+    RAP_NEIGHBOR_SNR = 0x21,    // len=3   uint16BE 对端短地址 + int8 我收它的 SNR
+    RAP_ROLE_CLASS = 0x22,      // len=1   0 BACKBONE/1 CLIENT/2 SENSOR/3 TRACKER/4 DTU/5 GATEWAY
+    RAP_ATTACH_SEQ = 0x23,      // len=2   uint16BE 归属序号，单调递增（后到覆盖先到）
+    RAP_TTL_GRANT = 0x24,       // len=2   uint16BE 授予的租期秒数
+    RAP_OWNER_LIST = 0x25,      // len=N*4 uint16BE 终端短地址 + uint16BE attachSeq（条目数组）
+    RAP_OWNER_DEL = 0x26,       // len=N*2 uint16BE 终端短地址数组（已离开我）
+    RAP_TABLE_VERSION = 0x27,   // len=2   uint16BE 本机归属表版本号，每次变更 +1
+    RAP_LINK_COST = 0x28,       // len=1   int8 双向链路代价 min(snr_AB,snr_BA)，单位 dB
+} RapTlv;
+
+// 角色分类（对应 RAP_ROLE_CLASS；datapack.txt R7）
+typedef enum {
+    RAP_ROLE_BACKBONE = 0,
+    RAP_ROLE_CLIENT = 1,
+    RAP_ROLE_SENSOR = 2,
+    RAP_ROLE_TRACKER = 3,
+    RAP_ROLE_DTU = 4,
+    RAP_ROLE_GATEWAY = 5,
+} RapRoleClass;
+
+// ============================================================================
+// RAP 实现常量（来源 datapack.txt R11 / route.txt §10.5，权威取值）
+// ============================================================================
+#define RAP_HELLO_PERIOD_MS        (90UL * 1000UL) // 90s（470MHz 占空比反推，下限64.4s+余量）
+#define RAP_HELLO_JITTER_MS        (30UL * 1000UL) // 30s 随机上线抖动，防上线风暴碰撞
+#define RAP_NEIGHBOR_TTL_MS        (270UL * 1000UL) // 3 × HELLO_PERIOD
+#define RAP_FULL_ADV_PERIOD_MS     (30UL * 60UL * 1000UL) // 30min 低频全量通告（软状态收敛）
+#define RAP_ADV_MAX_ENTRIES_PER_FRAME 16  // 470MHz 单次发射 ≤1s 硬约束推出（全量32条 ToA 超限，须分片）
+#define RAP_MAX_NEIGHBORS         16   // 单蜂窝骨干密度
+#define RAP_MAX_OWNED             32   // 单 BACKBONE 归属表上限
+#define RAP_MAX_REMOTE_OWNERS     64   // 邻居通告汇总表
+#define RAP_KEEPALIVE_CLIENT_MS    (10UL * 60UL * 1000UL) // 10min（信道总负载修正后）
+#define RAP_KEEPALIVE_DTU_MS       (10UL * 60UL * 1000UL) // 10min
+#define RAP_KEEPALIVE_SENSOR_MS    (30UL * 60UL * 1000UL) // 30min（捎带）
+#define RAP_TTL_CLIENT_MS          (30UL * 60UL * 1000UL) // 3 × Keepalive
+#define RAP_TTL_DTU_MS             (30UL * 60UL * 1000UL) // 3 × Keepalive
+#define RAP_TTL_SENSOR_MS          (2UL * 60UL * 60UL * 1000UL) // 2h
+#define RAP_TTL_TRACKER_MS         (6UL * 60UL * 60UL * 1000UL) // 6h
+#define RAP_HYST_SNR_DB            6    // 铁律三：候选优于当前至少 6dB
+#define RAP_HYST_SAMPLES           3    // 铁律三：连续 3 次独立采样
+#define RAP_MIN_DWELL_MS            (10UL * 60UL * 1000UL) // 铁律三：最短驻留 10min
+#define RAP_ROUTE_FAIL_THRESHOLD   3    // 定向投递连续失败即清条目落回洪泛
+#define RAP_MAX_HELLO_BACKOFF_MS    (12UL * 60UL * 1000UL) // 指数退避上限 12min（2^3 × 90s）
+#define RAP_LBT_UTIL_THRESHOLD_PCT 40   // 信道利用率超 40% 推迟本次 HELLO
+#define RAP_ATTACH_RETRY_MS        (30UL * 1000UL)
+#define RAP_EVAL_INTERVAL_MS       (15UL * 1000UL)
 
 // 优先级（ctrl_flag bit3-4）
 typedef enum {
@@ -146,7 +209,52 @@ struct MeshRocSeenEntry {
     uint32_t seenAt;
 };
 
-class MeshRocModule : public SinglePortModule {
+// ============================================================================
+// RAP 数据结构（datapack.txt R6）
+// ============================================================================
+
+// 对端 BACKBONE 邻居表项（仅 BACKBONE 维护）
+struct RapNeighborEntry {
+    uint32_t backbone;       // 对端完整 NodeNum
+    int8_t snrMyToIt;        // 我收它的 SNR
+    int8_t snrItToMe;        // 它回报收我的 SNR（来自 HELLO_ACK 的 RAP_NEIGHBOR_SNR）
+    int8_t linkCost;         // 双向代价 = min(snrMyToIt, snrItToMe)
+    uint32_t lastHelloAt;    // 收到 HELLO 的时间戳（ms）
+    uint32_t lastAckAt;      // 收到 HELLO_ACK 的时间戳（ms，准入标志）
+    bool acked;              // 是否回过 HELLO_ACK（未回 ACK 不算邻居，排除原版 ROUTER）
+    uint16_t tableVersion;   // 最后已知对端归属表版本
+};
+
+// 归属表项（BACKBONE 维护下属；终端侧也用同一结构记自己归属）
+struct RapOwnerEntry {
+    uint32_t node;           // 被归属节点完整 NodeNum（自维护完整，仅上空口降级短地址）
+    uint32_t ownerBackbone;  // 归属的 BACKBONE（终端侧为自己当前 attachedTo）
+    uint16_t attachSeq;      // 归属序号，单调递增
+    uint32_t ttlExpireAt;    // 租期到期时间戳（ms），软状态靠 Keepalive 续租
+    uint8_t roleClass;       // RAP_ROLE_CLASS
+    uint8_t failCount;       // 定向投递连续失败计数（仅 BACKBONE 侧用于路由失效）
+};
+
+// 终端侧本地状态机
+typedef enum {
+    RAP_STATE_SCANNING = 0,  // 尚无归属
+    RAP_STATE_ATTACHED = 1,  // 已归属
+    RAP_STATE_EVALUATING = 2,// 发现更优候选，迟滞评估中
+} RapTerminalState;
+
+struct RapLocalState {
+    RapTerminalState state;  // 终端状态机
+    uint32_t attachedTo;     // 当前归属 BACKBONE（0 = 无）
+    uint16_t attachSeq;      // 本机归属序号（每次切换 +1）
+    uint32_t lastKeepaliveAt;// 上次续租时间戳
+    uint32_t lastEvalAt;     // 上次评估时间戳
+    uint32_t minDwellUntil;  // 最短驻留到期（铁律三 c）
+    int8_t curSnr;           // 当前归属链路 SNR
+    int8_t hystSamples;      // 连续满足迟滞(a)的采样计数（铁律三 b）
+    uint32_t lastAttachReqAt;// 上次发 ATTACH_REQ 时间戳
+};
+
+class MeshRocModule : public SinglePortModule, private concurrency::OSThread {
   public:
     MeshRocModule();
 
@@ -189,6 +297,12 @@ class MeshRocModule : public SinglePortModule {
     // 取对端最近记录的最佳 SNR（无记录返回 0）
     int8_t getPeerSnr(uint32_t nodeNum) const;
 
+    // ---- RAP 双栈公开接口（供 NextHopRouter 调用，route.txt §10.3）----
+    // 返回目标节点的「唯一末字节」下一跳；若 RAP 无归属信息或不可达则返回 nullopt（落回洪泛）。
+    std::optional<uint8_t> getRapNextHop(uint32_t to);
+    // 由 NextHopRouter::noteRouteFailure 调用，记录定向投递失败（连续失败清条目落回洪泛）。
+    void noteRapRouteFailure(uint32_t toNode);
+
     // ---- 屏幕 UI 帧（功能丰富：让 MeshROC 在设备上可见）----
     // 注册一个模块帧，显示系统名/固件版本/本机产品线角色/已确认 MeshROC 对端数/端口300活动。
     // 通过 MeshModule::GetMeshModulesWithUIFrames 自动注入屏幕帧列表（见 Screen.cpp）。
@@ -208,6 +322,9 @@ class MeshRocModule : public SinglePortModule {
 
     // 重写 wantPacket：同时接收 Mesh-ROC 私有端口(300) 与 原生文本端口(1)。
     virtual bool wantPacket(const meshtastic_MeshPacket *p) override;
+
+    // RAP 周期任务（OSThread）：BACKBONE 发 HELLO / 全量通告 / 过期扫描；终端发 Keepalive / 评估。
+    virtual int32_t runOnce() override;
 
   private:
     // ---- 混合路由状态机 (route.txt §5) ----
@@ -232,6 +349,38 @@ class MeshRocModule : public SinglePortModule {
 
     // 去重：返回 true 表示已见过(丢弃), false 表示新包(记录)
     bool seenCheck(uint16_t src, uint16_t seq);
+
+    // ---- RAP（Router Attach Protocol，datapack.txt R1~R12）----
+    // RAP 帧分发：handleReceived 在 ctrl_flag 类型==MESHROC_TYPE_RAP(7) 时调用。
+    void onRapPacket(const MeshRocPacket &pkt, uint8_t payloadLen, const meshtastic_MeshPacket &mp);
+    // RAP 发送构造
+    void sendRapHello(bool fullAdv = false);
+    void sendRapHelloAck(uint32_t dst, int8_t snrToIt);
+    void sendRapAttachReq(uint32_t backbone);
+    void sendRapAttachAck(uint32_t dst, uint16_t ttlGrant, uint16_t attachSeq);
+    void sendRapKeepalive(bool standalone = true);
+    void sendRapDetach(uint32_t oldOwner);
+    void sendRapOwnershipAdv(const RapOwnerEntry *entries, uint8_t count, bool isDelete = false);
+    void sendRapSyncReq(uint32_t dst);
+    // RAP 接收处理
+    void onRapHello(const MeshRocPacket &pkt, uint8_t payloadLen, uint32_t from);
+    void onRapHelloAck(const MeshRocPacket &pkt, uint8_t payloadLen, uint32_t from);
+    void onRapAttachReq(const MeshRocPacket &pkt, uint8_t payloadLen, uint32_t from);
+    void onRapAttachAck(const MeshRocPacket &pkt, uint8_t payloadLen, uint32_t from);
+    void onRapKeepalive(const MeshRocPacket &pkt, uint8_t payloadLen, uint32_t from);
+    void onRapDetach(const MeshRocPacket &pkt, uint8_t payloadLen, uint32_t from);
+    void onRapOwnershipAdv(const MeshRocPacket &pkt, uint8_t payloadLen, uint32_t from);
+    void onRapSyncReq(const MeshRocPacket &pkt, uint8_t payloadLen, uint32_t from);
+    // RAP 内部工具
+    RapNeighborEntry *findNeighbor(uint32_t bb);
+    RapOwnerEntry *findOwner(uint32_t node);
+    RapOwnerEntry *findRemoteOwner(uint32_t node);
+    void pruneExpiredOwners();
+    void pruneExpiredNeighbors();
+    void bumpTableVersion();
+    int8_t computeLinkCost(int8_t a, int8_t b);
+    uint32_t rapTtlForRole(uint8_t role);
+    uint8_t localRoleClass() const;
 
   private:
     // 解析 datapack 帧（已校验 CRC），按 TLV 分发处理
@@ -283,6 +432,23 @@ class MeshRocModule : public SinglePortModule {
     };
     PeerCap            peerCaps[MESHROC_MAX_PEERS];
     uint8_t            peerCapsIdx = 0;
+
+    // ---- RAP 状态（datapack.txt R6）。BACKBONE 判定复用 localRole。----
+    RapLocalState      rapLocal;                  // 终端侧状态（仅非 BACKBONE 使用）
+    RapNeighborEntry   rapNeighbors[RAP_MAX_NEIGHBORS]; // BACKBONE 互相邻居表
+    RapOwnerEntry      rapOwnerTable[RAP_MAX_OWNED];     // 本 BACKBONE 下属表
+    RapOwnerEntry      rapRemoteOwners[RAP_MAX_REMOTE_OWNERS]; // 邻居通告的归属汇总
+    uint8_t            nNeighbors = 0;
+    uint8_t            nOwners = 0;
+    uint8_t            nRemoteOwners = 0;
+    uint16_t           rapTableVersion = 0;       // 本机归属表版本
+    uint16_t           rapNextAttachSeq = 1;      // 本机发出的归属序号分配器
+    uint32_t           lastHelloSentAt = 0;       // 上次 HELLO 时间戳
+    uint8_t            helloBackoffPow = 0;       // 指数退避指数 k
+    uint32_t           lastFullAdvAt = 0;         // 上次全量通告
+
+    // 本机是否 RAP BACKBONE（ROUTER/ROUTER_LATE 角色）
+    bool isBackbone() const { return localRole == MESHROC_ROLE_BACKBONE; }
 };
 
 // 全局单例（定义于 MeshRocModule.cpp），供其它模块/服务自动调用 MeshROC 能力
