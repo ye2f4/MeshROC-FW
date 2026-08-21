@@ -50,6 +50,7 @@ build_heltec.log
 uvwrap.cs
 uv_call.log
 meshtestic/
+submod_status.txt
 
 # Local project data (not part of the repo)
 .codebuddy/
