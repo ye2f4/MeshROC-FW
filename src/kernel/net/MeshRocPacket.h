@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
-#include "config/MeshROCConfig.h"
+#include "kernel/config/MeshROCConfig.h"
 
 /**
  * MeshRocPacket 协议头（§13.1 / §14.1）
@@ -23,6 +23,13 @@ enum class MeshRocPacketType : uint8_t {
 };
 
 // ---- 优先级（ctrl_flag bit3-4） ----
+// Arduino 框架（esp32-hal-gpio.h）把 LOW/HIGH 定义为宏，会污染本枚举解析，先取消。
+#ifdef LOW
+#undef LOW
+#endif
+#ifdef HIGH
+#undef HIGH
+#endif
 enum class MeshRocPriority : uint8_t {
     LOWEST  = 0,
     LOW     = 1,
@@ -41,7 +48,9 @@ struct CtrlFlag {
 };
 static_assert(sizeof(CtrlFlag) == 1, "CtrlFlag must be 1 byte");
 
-// ---- 10 字节固定包头 ----
+// ---- 10 字节固定包头；随后 TLV 段；帧尾 2 字节 CRC16-MODBUS（见 D1/D3 决策）----
+// 字节序：大端（匹配真实 datapack 空中字节）。CRC16 不进包头 struct，附在帧尾。
+#pragma pack(push, 1)
 struct MeshRocPacket {
     uint8_t   ctrl_flag;     // 见 CtrlFlag 位域
     uint16_t  src;           // 源短地址
@@ -50,21 +59,22 @@ struct MeshRocPacket {
     uint8_t   max_hop;       // 双层跳数硬下限（datapack 主导）
     int8_t    snr;           // 接收 SNR（回填，§13.5）
     uint8_t   route_mode;    // 0=洪泛 1=源路由 2=RAP 定向
-    uint8_t   crc;           // 包头 CRC8
 
     // 包头后接 TLV 段（§13.3 业务 TLV 0x01-0x13 / §13.2 RAP TLV 0x20-0x28）
+    // TLV 段后附 2 字节 CRC16-MODBUS（poly=0x1021, init=0xFFFF，大端写入）
 
     constexpr static size_t HEADER_LEN = 10;
 
     CtrlFlag ctrl() const { return reinterpret_cast<const CtrlFlag&>(ctrl_flag); }
 
-    MeshRocPacketType  type()     const { return static_cast<MeshRocPacketType>(ctrl() & 0x07); }
+    MeshRocPacketType  type()     const { return static_cast<MeshRocPacketType>(ctrl_flag & 0x07); }
     MeshRocPriority    priority() const { return static_cast<MeshRocPriority>((ctrl_flag >> 3) & 0x03); }
     bool               wantAck()  const { return (ctrl_flag >> 5) & 0x01; }
     bool               relayPerm()const { return (ctrl_flag >> 6) & 0x01; }
     bool               compressed()const{ return (ctrl_flag >> 7) & 0x01; }
 };
 static_assert(sizeof(MeshRocPacket) == MeshRocPacket::HEADER_LEN, "header must be 10 bytes");
+#pragma pack(pop)
 
 // ---- 业务 TLV tag（§13.3，0x01-0x13） ----
 enum class MeshRocTlv : uint8_t {

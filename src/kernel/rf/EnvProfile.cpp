@@ -1,4 +1,4 @@
-#include "rf/EnvProfile.h"
+#include "kernel/rf/EnvProfile.h"
 
 namespace meshroc::rf {
 
@@ -10,7 +10,7 @@ namespace meshroc::rf {
 //   SHORT_FAST    : 较短距离、较高速率
 //   SHORT_TURBO   : 短距离、最高速率（宽 BW，CN region 合法但需 region 允许）
 // 仅当调用方用 region 预设表校验通过后才采用，否则沿用当前配置。
-meshtastic_Config_LoRaConfig_ModemPreset EnvProfile::intendedPreset(Terrain t)
+meshtastic_Config_LoRaConfig_ModemPreset EnvProfile::intendedPreset(EnvProfile::Terrain t)
 {
     switch (t) {
     case Terrain::GOBI:            return meshtastic_Config_LoRaConfig_ModemPreset_LONG_SLOW;
@@ -23,7 +23,7 @@ meshtastic_Config_LoRaConfig_ModemPreset EnvProfile::intendedPreset(Terrain t)
     }
 }
 
-Terrain EnvProfile::classify(const LinkSample& s) const
+EnvProfile::Terrain EnvProfile::classify(const LinkSample& s) const
 {
     // FIXED 模式：不做自适应，保持中性城镇预设
     if (cfg_.rf.envProfile == config::RfOptimization::EnvProfile::FIXED) {

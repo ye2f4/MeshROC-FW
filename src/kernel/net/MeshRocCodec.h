@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
-#include "net/MeshRocPacket.h"
+#include "kernel/net/MeshRocPacket.h"
 
 /**
  * MeshRocCodec：包头与 TLV 的纯算法编解码（§14.1 零依赖平移）

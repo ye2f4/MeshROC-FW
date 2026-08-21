@@ -101,7 +101,7 @@
 #endif
 
 // Mesh-ROC 定制协议模块（datapack.txt）—— 独立封装，不改动原生传输层
-#include "modules/MeshRocModule.h"
+#include "modules/MeshROCStatusModule.h"
 #if !MESHTASTIC_EXCLUDE_RANGETEST && !MESHTASTIC_EXCLUDE_GPS
 #include "modules/RangeTestModule.h"
 #endif
@@ -208,8 +208,11 @@ void setupModules()
     // Example: Put your module here
     // new ReplyModule();
 
-    // Mesh-ROC 定制协议模块（datapack.txt）：始终启用，封装 10字节头+TLV+CRC16 帧进私有 portnum
-    meshRocModule = new MeshRocModule();
+    // MeshROC 第一公民栈(src/kernel)直接驱动射频，不再需要叠加态旧模块。
+    // 屏幕 UI 帧由 MeshROCStatusModule 提供（只读绑定 g_meshrocBridge）。
+#if HAS_SCREEN
+    new MeshROCStatusModule();
+#endif
 #if HAS_SCREEN && !MESHTASTIC_EXCLUDE_CANNEDMESSAGES
     if (config.display.displaymode != meshtastic_Config_DisplayConfig_DisplayMode_COLOR) {
         cannedMessageModule = new CannedMessageModule();

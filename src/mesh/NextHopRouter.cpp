@@ -9,7 +9,11 @@
 #include "modules/TrafficManagementModule.h"
 #endif
 #include "NodeDB.h"
-#include "modules/MeshRocModule.h"
+
+// 注意：原 MeshRocModule 的 RAP 定向下一跳注入已移除（8.5 融合）。
+// 第一公民栈(src/kernel)的帧走 startSendRaw 直发，不经 Meshtastic MeshPacket 路由，
+// 故 NextHopRouter 不再需要、也不应借用 RAP 表来决定 Meshtastic 流量的下一跳。
+// Meshtastic 自身的 FloodingRouter/NextHopRouter 仍按原版逻辑运行。
 
 #if USERPREFS_EVENT_MODE
 static void capEventRelayHops(meshtastic_MeshPacket *packet)
@@ -267,23 +271,6 @@ std::optional<uint8_t> NextHopRouter::getNextHop(NodeNum to, uint8_t relay_node)
 {
     if (isBroadcast(to))
         return std::nullopt;
-
-    // --- RAP dual-stack injection (route.txt §10.1) ---
-    // RAP provides a directed hop ONLY when the destination's owning BACKBONE is
-    // known and reachable; otherwise it must fall through to native flooding.
-    // This is the SINGLE injection point — FloodingRouter::perhapsRebroadcast is
-    // left byte-for-byte original (HARD RULE §10.2: never suppress first relay).
-    // meshRocModule is a global singleton; it returns a UNIQUE last byte (already
-    // passed through resolveUniqueLastByte) or nullopt to fall back to flooding.
-    // We only take the RAP path on ROUTER (BACKBONE) nodes, where ownership tables
-    // are maintained; terminals never originate directed RAP hops here.
-    if (config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER && meshRocModule) {
-        auto rapHop = meshRocModule->getRapNextHop(to);
-        if (rapHop.has_value()) {
-            LOG_DEBUG("RAP directed next_hop 0x%x for 0x%08x", *rapHop, to);
-            return *rapHop;
-        }
-    }
 
     // Hot store first: a direct array hit on the live NodeDB entry.
     meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(to);
@@ -608,12 +595,6 @@ void NextHopRouter::noteRouteSuccess(NodeNum dest, uint32_t now)
 
 void NextHopRouter::noteRouteFailure(NodeNum dest)
 {
-    // RAP dual-stack (route.txt §10.3): feed directed-delivery failures into RAP's
-    // owner table so a dead owning BACKBONE gets dropped and the next packet falls
-    // back to flooding automatically (RAP_ROUTE_FAIL_THRESHOLD = 3 consecutive).
-    if (meshRocModule)
-        meshRocModule->noteRapRouteFailure(dest);
-
     RouteHealth *h = findRouteHealth(dest);
     if (!h)
         return; // nothing to penalize (we were flooding, or never learned a route here)

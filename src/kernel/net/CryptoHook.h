@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
-#include "config/MeshROCConfig.h"
+#include "kernel/config/MeshROCConfig.h"
 
 /**
  * CryptoHook：O3 加密调用钩子（原创优化 O3，对应网站承诺）
@@ -20,6 +20,11 @@ namespace meshroc::net {
 
 class CryptoHook {
 public:
+    // Arduino 框架（esp32-hal-gpio.h）把 DISABLED/ENABLED/LOW/HIGH 等定义为宏，
+    // 会污染本枚举的解析。在定义前取消，避免 "DISABLED = 1" 被替换成 "0x00 = 1"。
+#ifdef DISABLED
+#undef DISABLED
+#endif
     enum class Result : uint8_t {
         OK = 0,
         DISABLED = 1,        // 加密未启用，调用方应直接发明文

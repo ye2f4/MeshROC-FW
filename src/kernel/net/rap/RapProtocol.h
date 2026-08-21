@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
-#include "net/MeshRocPacket.h"
+#include "kernel/net/MeshRocPacket.h"
 
 /**
  * RAP（Router Attach Protocol）归属协议定义（§13.2）
@@ -18,6 +18,8 @@ enum class RapKind : uint8_t {
     ATTACH_ACK = 4,
     KEEPALIVE  = 5,
     DETACH     = 6,
+    OWNERSHIP_ADV = 7,  // 骨干向终端广播归属表（OWNER_LIST / OWNER_DEL）
+    SYNC_REQ      = 8,  // 终端向骨干请求全量归属表同步
 };
 
 // ---- RAP TLV（0x20-0x28，与原版 0x01-0x13 不冲突，§13.2） ----
@@ -46,6 +48,10 @@ constexpr uint32_t HELLO_BACKOFF_MAX_MS   = 12 * 60 * 1000;  // 12min
 constexpr uint8_t  LBT_UTIL_THRESHOLD_PCT = 40;     // 信道利用率阈值
 constexpr uint32_t ATTACH_RETRY_MS        = 30'000;  // 30s
 constexpr uint32_t EVAL_INTERVAL_MS       = 15'000;  // 15s
+// 归属失联判定（ATTACHED 状态下超过该时长无活动 → 回 SCANNING 重发现）
+constexpr uint32_t ATTACH_TIMEOUT_MS      = 270'000; // 270s（等同 NEIGHBOR_TTL）
+// 归属续租周期（ATTACHED 状态下周期性发 KEEPALIVE 续租）
+constexpr uint32_t KEEPALIVE_PERIOD_MS    = 60'000;  // 60s
 
 // 续租 TTL（秒）：CLIENT/DTU=30min SENSOR=2h TRACKER=6h（§13.2 / §11.3）
 constexpr uint32_t TTL_CLIENT_S  = 30 * 60;

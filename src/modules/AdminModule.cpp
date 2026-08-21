@@ -16,7 +16,7 @@
 #include <Throttle.h>
 #include <ctype.h> // for better whitespace handling
 #if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_WIFI
-#include "MeshtasticOTA.h"
+#include "MeshROCOTA.h"
 #endif
 #include "Router.h"
 #include "configuration.h"
@@ -400,7 +400,7 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
         const char *mode_name = (mode == METHOD_OTA_BLE ? "BLE" : "WiFi");
 
         // Check that we have an OTA partition
-        const esp_partition_t *part = MeshtasticOTA::getAppPartition();
+        const esp_partition_t *part = MeshROCOTA::getAppPartition();
         if (part == NULL) {
             suppressRebootBanner = true;
             sendWarningAndLog("Cannot start OTA: Cannot find OTA Loader partition.");
@@ -408,23 +408,23 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
         }
 
         static esp_app_desc_t app_desc;
-        if (!MeshtasticOTA::getAppDesc(part, &app_desc)) {
+        if (!MeshROCOTA::getAppDesc(part, &app_desc)) {
             suppressRebootBanner = true;
             sendWarningAndLog("Cannot start OTA: Device does have a valid OTA Loader.");
             break;
         }
 
-        if (!MeshtasticOTA::checkOTACapability(&app_desc, mode)) {
+        if (!MeshROCOTA::checkOTACapability(&app_desc, mode)) {
             suppressRebootBanner = true;
             sendWarningAndLog("OTA Loader does not support %s", mode_name);
             break;
         }
 
-        if (MeshtasticOTA::trySwitchToOTA()) {
+        if (MeshROCOTA::trySwitchToOTA()) {
             suppressRebootBanner = true;
             if (screen)
                 screen->startFirmwareUpdateScreen();
-            MeshtasticOTA::saveConfig(&config.network, mode, r->ota_request.ota_hash.bytes);
+            MeshROCOTA::saveConfig(&config.network, mode, r->ota_request.ota_hash.bytes);
             sendWarningAndLog("Rebooting to %s OTA", mode_name);
         } else {
             sendWarningAndLog("Unable to switch to the OTA partition.");

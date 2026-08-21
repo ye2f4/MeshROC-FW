@@ -1,19 +1,22 @@
 #pragma once
 #include <cstdint>
-#include "config/MeshROCConfig.h"
-#include "net/MeshRocPacket.h"
+#include "kernel/config/MeshROCConfig.h"
+#include "kernel/net/MeshRocPacket.h"
 
 /**
- * NextHopRouter：自适应跳数 + 转发判据（§13.4 / §11.4）
- * 反转后取代原版 NextHopRouter 对 meshtastic_Config 的依赖。
- * 注：RAP 定向下一跳的启用条件统一为 isRelayAllowed()（§11.4），
- *      消除原版 "仅 ROUTER 启用 RAP 定向" 与 isBackboneRelay 的不一致。
+ * HopPlanner：自适应跳数规划器（§13.4 / §11.4）
+ * 仅负责「算出发包跳数上限」，不做真正的下一跳路由。
+ * 注意：与 src/mesh/NextHopRouter（原版 meshtastic 的完整路由器，继承 FloodingRouter、
+ *       处理重传与路由健康）是**两个不同职责的类**，仅名字相似。
+ *       此处重命名以彻底消除命名冲突，避免后续维护混淆。
+ * 转发判据统一为 isRelayAllowed()（§11.4），
+ *   消除原版 "仅 ROUTER 启用 RAP 定向" 与 isBackboneRelay 的不一致。
  */
 namespace meshroc::net {
 
-class NextHopRouter {
+class HopPlanner {
 public:
-    explicit NextHopRouter(const config::MeshROCConfig& cfg) : cfg_(cfg) {}
+    explicit HopPlanner(const config::MeshROCConfig& cfg) : cfg_(cfg) {}
 
     // 网络直径观测（10min TTL），由 NodeDB 注入；0 表示未知
     void setObservedDiameter(uint8_t diameter) { observedDiameter_ = diameter; }

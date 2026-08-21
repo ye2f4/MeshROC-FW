@@ -29,6 +29,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #if HAS_SCREEN
 #include "EInkParallelDisplay.h"
 #include <OLEDDisplay.h>
+#if OLED_CJK
+#include <utf8_12x12.h>
+#include <utf8_16x16.h>
+#include <utf8_24x24.h>
+#endif
+
 #if defined(MESHTASTIC_INCLUDE_NICHE_GRAPHICS) && !defined(MESHTASTIC_INCLUDE_INKHUD)
 // Provided by each niche-enabled variant's nicheGraphics.h (defined once, in the main.cpp TU).
 extern NicheGraphics::BaseUIEInkDisplay *setupNicheGraphicsBaseUI();
@@ -641,6 +647,18 @@ Screen::Screen(ScanI2C::DeviceAddress address, meshtastic_Config_DisplayConfig_O
     static_cast<ST7789Spi *>(dispdev)->setRGB(TFTPalette::White, (::TFTColorRegion *)colorRegions);
 #elif defined(USE_ST7796)
     static_cast<ST7796Spi *>(dispdev)->setRGB(TFTPalette::White);
+#endif
+
+#if OLED_CJK && (defined(USE_SSD1306) || defined(USE_SH1106) || defined(USE_SH1107) || defined(USE_SH1107_128_64) ||                 \
+                  defined(USE_ST7567) || defined(USE_SPISSD1306))
+    // CJK UTF8 字体设置（仅对 OLEDDisplay 类显示设备生效）
+    #if OLED_CJK_SIZE == 12
+    dispdev->setUtf8Font(&utf8_12x12_font);
+    #elif OLED_CJK_SIZE == 24
+    dispdev->setUtf8Font(&utf8_24x24_font);
+    #else
+    dispdev->setUtf8Font(&utf8_16x16_font);
+    #endif
 #endif
 
     ui = new OLEDDisplayUi(dispdev);

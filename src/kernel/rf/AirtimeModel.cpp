@@ -1,4 +1,4 @@
-#include "rf/AirtimeModel.h"
+#include "kernel/rf/AirtimeModel.h"
 
 namespace meshroc::rf {
 

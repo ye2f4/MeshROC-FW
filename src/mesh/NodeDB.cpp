@@ -72,7 +72,7 @@
 #endif
 
 #if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_WIFI
-#include <MeshtasticOTA.h>
+#include <MeshROCOTA.h>
 #endif
 
 NodeDB *nodeDB = nullptr;
@@ -1117,8 +1117,8 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
 #endif
 
 #if defined(ARCH_ESP32) && !MESHTASTIC_EXCLUDE_WIFI
-    if (MeshtasticOTA::isUpdated()) {
-        MeshtasticOTA::recoverConfig(&config.network);
+    if (MeshROCOTA::isUpdated()) {
+        MeshROCOTA::recoverConfig(&config.network);
     }
 #endif
 

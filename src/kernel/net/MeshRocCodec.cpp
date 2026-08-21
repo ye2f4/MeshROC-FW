@@ -1,4 +1,4 @@
-#include "net/MeshRocCodec.h"
+#include "kernel/net/MeshRocCodec.h"
 
 namespace meshroc::net {
 
@@ -19,14 +19,16 @@ uint8_t MeshRocCodec::crc8(const uint8_t* data, size_t len)
 
 void MeshRocCodec::finalizeHeader(MeshRocPacket& pkt)
 {
-    // CRC 覆盖前 9 字节（不含 crc 自身），与已部署格式一致
-    pkt.crc = crc8(reinterpret_cast<const uint8_t*>(&pkt), MeshRocPacket::HEADER_LEN - 1);
+    // D1/D3 决策后：包头不再含 CRC8 字段（CRC16-MODBUS 附在帧尾）。
+    // 保留此函数为 no-op 以保持 API 稳定；真正校验在 ingestRaw/emitSingle 的帧尾 CRC16。
+    (void)pkt;
 }
 
 bool MeshRocCodec::verifyHeader(const MeshRocPacket& pkt)
 {
-    uint8_t expect = crc8(reinterpret_cast<const uint8_t*>(&pkt), MeshRocPacket::HEADER_LEN - 1);
-    return expect == pkt.crc;
+    // 见 finalizeHeader：包头 CRC8 已废弃，恒为真。
+    (void)pkt;
+    return true;
 }
 
 uint8_t MeshRocCodec::makeCtrlFlag(MeshRocPacketType type,

@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
-#include "net/MeshRocPacket.h"
+#include "kernel/net/MeshRocPacket.h"
 
 /**
  * Reassembler：大包分片重组（原创优化 O5，对应网站承诺 #8）
@@ -12,10 +12,10 @@
  * 原版 Meshtastic 没有 FRAG_HEADER 这种 TLV，大包处理走 protobuf 层自身路径。
  * 因此 FRAG_HEADER(0x14)/FRAG_NACK(0x15) 是 MeshRoc 私有 TLV，仅在同一 MeshROC 固件间有效。
  *
- * 当前状态：本类实现**接收端**重组逻辑；但**发送端分片器尚未实现**——
- * 即没有任何代码把 >MAX_PAYLOAD 的大包切成带 FRAG_HEADER 的片并发送，
- * 故 Reassembler 目前处于「接收端就绪、发送端缺失」的半成品状态。开启 rf.fragEnabled
- * 不会自动产生分片。需配套实现发送端分片（在 MeshRocPacket 发送路径上切割 + 打 FRAG_HEADER）。
+ * 当前状态：本类实现**接收端**重组逻辑；**发送端分片器已由 MeshRocStack::sendFragmented
+ * 实现**（> MAX_PAYLOAD 的大包会被切成带 FRAG_HEADER 的片并发送），并配套 FRAG_NACK
+ * 选择性重传闭环（发送端缓存分片 + 接收端回 NACK + tick 超时兜底重发，上限 3 次）。
+ * FRAG_HEADER(0x14)/FRAG_NACK(0x15) 是 MeshRoc 私有 TLV，仅在同一 MeshROC 固件间有效。
  *
  * 借鉴原版调度思路：选择性重传（FRAG_NACK）的超时/退避应复用 O4 AckPolicy 的
  * airtime+CW 推导策略，而非另立超时表。
@@ -28,7 +28,8 @@ namespace meshroc::net {
 
 class Reassembler {
 public:
-    static constexpr uint8_t  MAX_FRAG_TOTAL = 64;     // 单大包最大分片数
+    // 单大包最大分片数：32 片 × ~1KB 单片 ≈ 32KB 重组上限，足够文本/传感大包且省 RAM
+    static constexpr uint8_t  MAX_FRAG_TOTAL = 32;
     static constexpr uint16_t MAX_PAYLOAD    = 1024;   // 重组后最大载荷
     static constexpr uint32_t FRAG_TTL_MS    = 30000;  // 分片组存活窗口
 
@@ -58,7 +59,7 @@ private:
         bool     active = false;
     };
 
-    static constexpr uint8_t MAX_GROUPS = 8;                 // 并发重组组数
+    static constexpr uint8_t MAX_GROUPS = 4;                 // 并发重组组数（压 RAM：原 8）
     FragGroup groups_[MAX_GROUPS];
 
     FragGroup* findOrAdd(uint16_t src, uint16_t fragId, uint32_t nowMs);

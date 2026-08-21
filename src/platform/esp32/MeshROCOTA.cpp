@@ -1,17 +1,17 @@
-#include "MeshtasticOTA.h"
+#include "MeshROCOTA.h"
 #include "configuration.h"
 #ifdef ESP_PLATFORM
 #include <Preferences.h>
 #include <esp_ota_ops.h>
 #endif
 
-namespace MeshtasticOTA
+namespace MeshROCOTA
 {
 
-static const char *nvsNamespace = "MeshtasticOTA";
-static const char *combinedAppProjectName = "MeshtasticOTA";
-static const char *bleOnlyAppProjectName = "MeshtasticOTA-BLE";
-static const char *wifiOnlyAppProjectName = "MeshtasticOTA-WiFi";
+static const char *nvsNamespace = "MeshROCOTA";
+static const char *combinedAppProjectName = "MeshROCOTA";
+static const char *bleOnlyAppProjectName = "MeshROCOTA-BLE";
+static const char *wifiOnlyAppProjectName = "MeshROCOTA-WiFi";
 
 static bool updated = false;
 
@@ -122,4 +122,4 @@ const char *getVersion()
     return app_desc.version;
 }
 
-} // namespace MeshtasticOTA
+} // namespace MeshROCOTA

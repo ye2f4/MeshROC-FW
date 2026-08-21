@@ -1,6 +1,6 @@
 #pragma once
 #include <cstdint>
-#include "net/MeshRocPacket.h"
+#include "kernel/net/MeshRocPacket.h"
 
 /**
  * AckPolicy：分级 ACK 策略（原创优化 O4，对应网站承诺 #10）

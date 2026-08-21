@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
-#include "config/MeshROCConfig.h"
+#include "kernel/config/MeshROCConfig.h"
 #include "mesh/generated/meshtastic/config.pb.h"
 
 /**

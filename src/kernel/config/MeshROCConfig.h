@@ -119,6 +119,11 @@ struct MeshROCConfig {
         char upstreamUrl[160] = {0};             // wss://meshroc.cc.cd/bridge
         char authToken[128]   = {0};             // 不回显明文
         bool autoReconnect    = true;
+
+        // Supabase 上行（GATEWAY 写 comments 表，使网页端留言板可见 MQTT/LoRa 消息）。
+        // 凭据运行时从配置加载，绝不硬编码进固件（2026-08-17 用户确认）。
+        char supabaseUrl[160] = {0};             // https://<project>.supabase.co
+        char supabaseKey[128] = {0};             // anon/public key
     } gateway;
 
     // 原创优化开关（§15.3）
@@ -128,5 +133,10 @@ struct MeshROCConfig {
     PowerConfig      power;
     OfflineCacheConfig offlineCache;
 };
+
+// 全局唯一配置实例（运行时由 FlashKV 加载；当前为默认构造）。
+// 各模块统一通过本访问器读写，避免跨 TU 的 static 耦合。
+extern MeshROCConfig gMeshRocConfig;
+inline MeshROCConfig &gConfig() { return gMeshRocConfig; }
 
 }  // namespace meshroc::config

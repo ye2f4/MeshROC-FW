@@ -13,10 +13,13 @@
  */
 
 #include "MeshROC.h"
-#include "rf/EnvProfile.h"  // 统一地形->预设定义，消除双表漂移
+#include "kernel/rf/EnvProfile.h"  // 统一地形->预设定义，消除双表漂移
+#include "mesh/generated/meshtastic/localonly.pb.h"  // meshtastic_LocalConfig（config 全局的真实类型）
 
-// 固件全局配置对象（与 RadioInterface / NodeDB 中定义一致）。
-extern struct meshtastic_Config config;
+// 固件全局配置对象（与 NodeDB.cpp:84 定义一致：meshtastic_LocalConfig config）。
+// 注意：meshtastic_Config 是 typedef 名（非 struct 标签），且全局 config 的类型是
+// meshtastic_LocalConfig（含 lora 等字段），不能用 `struct meshtastic_Config config;`。
+extern meshtastic_LocalConfig config;
 
 // 地理区域 id -> 自研地形枚举（与官网九类环境一一对应）。
 // 预设选择统一交由 EnvProfile::presetForTerrain 处理（单一真相），本函数只做地理->地形桥接。

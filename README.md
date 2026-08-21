@@ -22,28 +22,30 @@
 
 ## 概述
 
-**MeshROC（Mesh Radio-Optimized Communications，互联之域）** 是一套面向国产硬件与本地化场景优化的开源 LoRa  mesh 组网固件。它基于 [Meshtastic](https://meshtastic.org) 固件深度增强，在**完整保留与上游 Meshtastic 互联互通能力**的前提下，针对中国本土频段合规、复杂地形射频与骨干路由做了增强。
+**MeshROC（Mesh Radio-Optimized Communications，互联之域）** 是一套面向国产硬件与本地化场景优化的开源 LoRa mesh 组网固件。它以**自研协议栈 `src/kernel/` 为第一公民**（协议/RAP/路由/射频出口自主掌控），并复用 [Meshtastic](https://meshtastic.org) 固件作为宿主框架，在**保持与原版 Meshtastic 节点互通**的前提下，针对中国本土频段合规、复杂地形射频与骨干路由做了增强。
 
 固件支持多种硬件平台：ESP32、nRF52、RP2040 / RP2350，以及基于 Linux 的 Portduino 设备。
+
+### 架构立场：自研协议栈是第一公民
+
+MeshROC 并非"在 Meshtastic 上外挂一个模块"，而是**以自研协议栈 `src/kernel/` 为运行主体**：协议格式、RAP 归属、四相混合路由、射频字节出口全部由自研栈自主掌控。Meshtastic 固件在本项目中扮演**宿主框架 / 兼容底座**角色——提供平台适配、屏幕、蓝牙、与上游节点的互通能力，但自研栈的帧经 `RadioLibInterface::startSendRaw()` **直驱射频**，不经 `meshtastic_MeshPacket` 管线。
 
 ### 与 Meshtastic 的兼容性
 
 | 维度 | 兼容性 |
 | --- | --- |
-| 空中协议（MeshPacket / protobuf） | ✅ 100% 互通 |
-| 与普通 Meshtastic 节点混网 | ✅ 默认互通（文本走原生端口） |
-| Python CLI / 手机 App | ✅ 兼容 |
-| 信道加密 | ✅ 不变 |
+| 与原版 Meshtastic 节点混网 | ✅ 由宿主框架负责，默认互通 |
+| Python CLI / 手机 App | ✅ 兼容（经宿主框架） |
+| 信道加密 | ✅ 沿用 |
 | 构建体系（PlatformIO / protobufs） | ✅ 沿用 |
-
-> MeshROC 是 Meshtastic 的兼容增强分支，而非另起炉灶。默认配置下与普通 Meshtastic 节点可无缝混网。
 
 ### 核心特性
 
+- **自研协议栈（第一公民）**：10 字节大端包头 + TLV + CRC16-MODBUS 尾（`src/kernel/net/`），匹配真实 datapack 空中格式；O1 环境感知跳数、O2 TDMA 时隙、O3 加密钩子、O4 ACK 策略、O5 分片重组。
+- **RAP 归属协议**：终端节点归属到骨干节点，由 `src/kernel/net/rap/RapStateMachine` 全量实现。
+- **四相混合路由**：PHASE1 洪泛探测 / PHASE2 源路由 / PHASE3 ACK 超时失效回退 / PHASE4 受限洪泛，路由权威完全在自研栈内（`src/kernel/net/Router`）。
 - **本土合规**：默认以中国 CN 470MHz 频段、合规发射功率与标准调制预设运行。
 - **地形射频模板**：内置全国九类地形到标准 LoRa 参数的映射辅助（`src/mesh/MeshROC.cpp`）。
-- **增强骨干路由**：在保留上游混合路由/洪泛的基础上，叠加路由器归属（RAP）与分层源路由增强（`src/modules/MeshRocModule.cpp`）。
-- **双栈协议协商**：增强帧封装于私有端口（portnum 300），并通过原生文本端口（portnum 1）与普通节点保持互通，自动协商。
 
 ## 快速开始
 
@@ -52,7 +54,7 @@
 
 ## 许可证
 
-固件代码基于 Meshtastic 固件，以 **GPL-3.0** 许可证发布。硬件以开源硬件形式提供，站点与文档以 MIT 许可证发布。
+固件代码以 **GPL-3.0** 许可证发布（自研栈与集成的上游遵循各自许可）。硬件以开源硬件形式提供，站点与文档以 MIT 许可证发布。
 
 ## 社区
 
@@ -61,4 +63,4 @@
 
 ---
 
-*MeshROC 派生自 Meshtastic firmware（GPL-3.0），在兼容基础上进行本土化增强。*
+*MeshROC 以自研协议栈（src/kernel/）为第一公民，复用 Meshtastic 作为宿主框架保持节点互通；固件以 GPL-3.0 发布。*

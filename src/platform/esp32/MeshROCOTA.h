@@ -1,5 +1,5 @@
-#ifndef MESHTASTICOTA_H
-#define MESHTASTICOTA_H
+#ifndef MESHROCOTA_H
+#define MESHROCOTA_H
 
 #include "mesh-pb-constants.h"
 #include <Arduino.h>
@@ -10,7 +10,7 @@
 #define METHOD_OTA_BLE 1
 #define METHOD_OTA_WIFI 2
 
-namespace MeshtasticOTA
+namespace MeshROCOTA
 {
 void initialize();
 bool isUpdated();
@@ -21,6 +21,6 @@ void recoverConfig(meshtastic_Config_NetworkConfig *network);
 void saveConfig(meshtastic_Config_NetworkConfig *network, meshtastic_OTAMode method, uint8_t *ota_hash);
 bool trySwitchToOTA();
 const char *getVersion();
-} // namespace MeshtasticOTA
+} // namespace MeshROCOTA
 
-#endif // MESHTASTICOTA_H
+#endif // MESHROCOTA_H

@@ -27,6 +27,8 @@
 #include "ESP32_CH390.h"
 #endif // USE_CH390D
 #include "Default.h"
+#include "kernel/config/MeshROCConfig.h"
+#include "modules/SupabaseBridge.h"
 #include <Throttle.h>
 #include <assert.h>
 #include <utility>
@@ -753,6 +755,22 @@ void MQTT::onSend(const meshtastic_MeshPacket &mp_encrypted, const meshtastic_Me
                                             .gateway_id = const_cast<char *>(nodeId.c_str())};
     size_t numBytes = pb_encode_to_bytes(bytes, sizeof(bytes), &meshtastic_ServiceEnvelope_msg, &env);
     std::string topic = cryptTopic + channelId + "/" + nodeId;
+
+    // GATEWAY 角色：把上行的文本消息同时写入 Supabase（使网页端留言板可见 MQTT 设备消息）。
+    // 仅在 GATEWAY 角色且凭据已配置时触发，fire-and-forget，不阻塞 MQTT 上行。
+    if (p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP &&
+        meshroc::config::gConfig().deviceRole == meshroc::config::MeshRocRole::GATEWAY) {
+        const char *text = (const char *)p->decoded.payload.bytes;
+        if (text && text[0]) {
+            const char *postId = (p->channel == 1) ? "/meshroc-guestbook-mediumfast"
+                                                   : (p->channel == 0 ? "/meshroc-guestbook-longfast" : "/meshroc-guestbook");
+            char nick[16];
+            snprintf(nick, sizeof(nick), "!%04X", (unsigned)(p->from & 0xFFFF));
+            meshroc::supabasePostComment(meshroc::config::gConfig().gateway.supabaseUrl,
+                                        meshroc::config::gConfig().gateway.supabaseKey,
+                                        postId, text, nick);
+        }
+    }
 
     if (moduleConfig.mqtt.proxy_to_client_enabled || this->isConnectedDirectly()) {
         LOG_DEBUG("MQTT Publish %s, %u bytes", topic.c_str(), numBytes);
