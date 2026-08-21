@@ -52,6 +52,19 @@
 #endif
 #include "sleep.h"
 #include "target_specific.h"
+
+#ifdef MESHROC_NATIVE_STACK
+#include "MeshROCBridge.h" // meshroc::RadioMeshRocBridge
+// 全局指针：setup() 中实例化并赋值，loop() 周期驱动 tick()。
+extern meshroc::RadioMeshRocBridge *g_meshrocBridge;
+
+// MESHTASTIC_AS_BRIDGE（A 选项 / 倒反天罡 开关，见 docs/MESHROC_INVERSION.md）：
+// 定义后，原版 ReliableRouter 不再 addInterface 主射频（main.cpp:1225），
+// 射频主权交给 RadioMeshRocBridge（经 RadioLibInterface::startSendRaw 直驱），
+// 原版 Meshtastic 栈降级为「翻译桥」仅做帧解析/桥接。
+// 该宏由 platformio.ini build_flags 显式定义才生效；未定义时保持 C 路线原状（不破坏现有全功能）。
+// 注意：MESHTASTIC_AS_BRIDGE 必须配合 MESHROC_NATIVE_STACK 才有意义（本块已隐含包含）。
+#endif
 #include <memory>
 #include <utility>
 #if HAS_SCREEN
@@ -1211,12 +1224,20 @@ void setup()
     else {
 #ifndef ARCH_PORTDUINO_WASM
         // Log bit rate to debug output
-        LOG_DEBUG("LoRA bitrate = %f bytes / sec", (float(meshtastic_Constants_DATA_PAYLOAD_LEN) /
+        LOG_DEBUG("LoRa bitrate = %f bytes / sec", (float(meshtastic_Constants_DATA_PAYLOAD_LEN) /
                                                     (float(rIf->getPacketTime(meshtastic_Constants_DATA_PAYLOAD_LEN)))) *
                                                        1000);
 #endif
 
+#ifndef MESHTASTIC_AS_BRIDGE
+        // C 路线（默认）：原版 ReliableRouter 独占主射频。
         router->addInterface(std::move(rIf));
+#else
+        // A 选项（倒反天罡）：射频主权交给 RadioMeshRocBridge（经 RadioLibInterface::startSendRaw 直驱）。
+        // rIf 仍由 initLoRa() 赋给 RadioLibInterface::instance（构造内 instance=this），
+        // 自研栈经该单例收发，无需挂给原版 router。此处仅消费局部变量避免 unused 警告。
+        (void)rIf;
+#endif
     }
 
     // This must be _after_ service.init because we need our preferences loaded from flash to have proper timeout values
@@ -1257,10 +1278,33 @@ void setup()
     // The node is up; let the SCM stop waiting on START_PENDING. No-op unless --service.
     windowsServiceReportRunning();
 #endif
+
+#ifdef MESHROC_NATIVE_STACK
+    // MESHROC 自研协议栈接入点（默认关闭，需 -DMESHROC_NATIVE_STACK 编译才启用）。
+    // radio 此时已由宿主配置好信道（region/modem preset/power），本桥复用现有信道，
+    // 不重新配置射频，与同信道其它 MESHROC 节点原生互通；meshtastic 流量不受影响。
+    {
+        static meshroc::RadioMeshRocBridge bridge(
+            config::MeshROCConfig{},
+            static_cast<uint16_t>(nodeDB->getNodeNum() & 0xFFFF),
+            /*isBackbone=*/false,
+            RadioLibInterface::instance);
+        // 注册为原始帧下沉点：radio 收到空中帧时先喂给自研栈（ingestRaw）。
+        bridge.registerWithRadio();
+        // 暴露给 loop() 周期驱动（RAP / 分片重组超时 / O4 重传）。
+        g_meshrocBridge = &bridge;
+        LOG_INFO("MESHROC native stack attached (addr=0x%04x)",
+                 static_cast<uint16_t>(nodeDB->getNodeNum() & 0xFFFF));
+    }
+#endif
 }
 
 #endif
-uint32_t rebootAtMsec;     // If not zero we will reboot at this time (used to reboot shortly after the update completes)
+uint32_t rebootAtMsec;
+
+#ifdef MESHROC_NATIVE_STACK
+meshroc::RadioMeshRocBridge *g_meshrocBridge = nullptr;
+#endif     // If not zero we will reboot at this time (used to reboot shortly after the update completes)
 uint32_t shutdownAtMsec;   // If not zero we will shutdown at this time (used to shutdown from python or mobile client)
 bool suppressRebootBanner; // If true, suppress "Rebooting..." overlay (used for OTA handoff)
 
@@ -1357,6 +1401,13 @@ void scannerToSensorsMap(const std::unique_ptr<ScanI2CTwoWire> &i2cScanner, Scan
 void loop()
 {
     runASAP = false;
+
+#ifdef MESHROC_NATIVE_STACK
+    // 周期驱动自研栈：RAP HELLO、分片重组超时、O4 重传、信道占用采样。
+    if (g_meshrocBridge) {
+        g_meshrocBridge->tick(millis());
+    }
+#endif
 
 #if defined(MESHTASTIC_ENCRYPTED_STORAGE) && defined(MESHTASTIC_PHONEAPI_ACCESS_CONTROL)
     if (lockdownDisablePending) {

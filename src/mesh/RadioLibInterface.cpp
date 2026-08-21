@@ -643,6 +643,15 @@ void RadioLibInterface::handleReceiveInterrupt()
         airTime->logAirtime(RX_ALL_LOG, rxMsec);
 
     } else {
+        // MeshRoc first-citizen stack: hand the raw bytes to the native stack BEFORE
+        // meshtastic parsing. The bridge decides whether this frame is one of its own
+        // (10B MeshRoc header + CRC16) and ignores foreign/garbled frames.
+        if (rawSink_) {
+            rawSink_((const uint8_t *)&radioBuffer, length,
+                     (int16_t)lround(iface->getRSSI()),
+                     (int8_t)iface->getSNR(), rawSinkCtx_);
+        }
+
         // Skip the 4 headers that are at the beginning of the rxBuf
         int32_t payloadLen = length - sizeof(PacketHeader);
 
@@ -697,6 +706,12 @@ void RadioLibInterface::handleReceiveInterrupt()
 #endif
 
             airTime->logAirtime(RX_LOG, rxMsec);
+
+            // MESHROC 兼容桥：把已解析的原版 meshtastic 包（仍加密）先喂给兼容桥嗅探。
+            // 桥据此识别同信道上的 Meshtastic 节点并（在解密后路径）转发 TEXT_MESSAGE 给 MeshRoc 栈。
+            if (meshtasticSink_) {
+                meshtasticSink_(mp, meshtasticSinkCtx_);
+            }
 
             deliverToReceiver(mp);
         }
@@ -796,4 +811,52 @@ bool RadioLibInterface::startSend(meshtastic_MeshPacket *txp)
 
         return res == RADIOLIB_ERR_NONE;
     }
+}
+
+bool RadioLibInterface::startSendRaw(const uint8_t *buf, size_t len)
+{
+    /* MeshRoc native transmit path.
+     * Mirrors startSend()'s transmit half but skips the meshtastic_MeshPacket pipeline.
+     * We deliberately do NOT set sendingPacket (the MeshRoc stack owns its own
+     * reliability/ACK logic), so completeSending() sees a NULL packet and is a no-op. */
+
+    if (disabled || !config.lora.tx_enabled) {
+        LOG_WARN("Drop raw Tx frame because LoRa Tx disabled");
+        return false;
+    }
+    if (!buf || len == 0 || len > sizeof(radioBuffer)) {
+        LOG_ERROR("Drop raw Tx frame: invalid len=%u", (unsigned)len);
+        return false;
+    }
+
+    configHardwareForSend(); // sets powerMon TX-on state, matches startSend()
+
+    int res = iface->startTransmit((uint8_t *)buf, len);
+    if (res != RADIOLIB_ERR_NONE) {
+        LOG_ERROR("startSendRaw startTransmit failed, error=%d", res);
+        RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_RADIO_SPI_BUG);
+        powerMon->clearState(meshtastic_PowerMon_State_Lora_TXOn);
+        startReceive(); // restart RX because we never entered xmit mode
+        return false;
+    }
+
+    enableInterrupt(isrTxLevel0);
+    lastTxStart = millis();
+    LOG_DEBUG("Started raw MeshRoc Tx (%u bytes)", (unsigned)len);
+#ifdef LED_LORA
+    digitalWrite(LED_LORA, LED_STATE_ON);
+#endif
+    return true;
+}
+
+uint8_t RadioLibInterface::currentChannelUtilization() const
+{
+    if (airTime)
+        return static_cast<uint8_t>(airTime->channelUtilizationPercent());
+    return 0;
+}
+
+uint32_t RadioLibInterface::currentSlotTimeMsec() const
+{
+    return slotTimeMsec;
 }

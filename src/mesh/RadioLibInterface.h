@@ -7,6 +7,16 @@
 #include <RadioLib.h>
 #include <sys/types.h>
 
+// meshtastic_MeshPacket is a typedef generated in mesh.pb.h (protobuf). We must
+// include it so MeshtasticFrameSink can reference the parsed-packet type.
+#include "mesh/generated/meshtastic/mesh.pb.h"
+
+// MESHROC raw/meshtastic frame sinks (first-citizen stack hooks).
+// Declared at file scope (before class RadioLibInterface) so the member
+// fields rawSink_ / meshtasticSink_ below can reference these types.
+using RawFrameSink = void (*)(const uint8_t *buf, size_t len, int16_t rssi, int8_t snr, void *ctx);
+using MeshtasticFrameSink = void (*)(const meshtastic_MeshPacket *mp, void *ctx);
+
 // ESP32 has special rules about ISR code
 #ifdef ARDUINO_ARCH_ESP32
 #define INTERRUPT_ATTR IRAM_ATTR
@@ -99,6 +109,14 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     /// are _trying_ to receive a packet currently (note - we might just be waiting for one)
     bool isReceiving = false;
 
+    /// Optional sink for raw (non-meshtastic) frames, used by the MeshRoc first-citizen stack.
+    RawFrameSink rawSink_ = nullptr;
+    void *rawSinkCtx_ = nullptr;
+
+    /// Optional sink for already-parsed (but pre-decrypt) meshtastic packets, used by the compat bridge.
+    MeshtasticFrameSink meshtasticSink_ = nullptr;
+    void *meshtasticSinkCtx_ = nullptr;
+
   protected:
     // Noise floor tracking - rolling window of samples.
     static const uint8_t NOISE_FLOOR_SAMPLES = 20;
@@ -175,6 +193,37 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
                       RADIOLIB_PIN_TYPE busy, PhysicalLayer *iface = NULL);
 
     virtual ErrorCode send(meshtastic_MeshPacket *p) override;
+
+    /**
+     * MESHROC native-stack transmit path.
+     *
+     * Sends a fully-formed (header + TLV + CRC16) MeshRoc frame directly over the
+     * radio, bypassing the meshtastic_MeshPacket pipeline. Mirrors the transmit half
+     * of startSend() but takes a raw buffer instead of a queued protobuf packet.
+     *
+     * The MeshRoc first-citizen stack (src/kernel) uses this to emit its own frames
+     * on the same channel the device is already configured for. Meshtastic traffic is
+     * unaffected because it still goes through send()/startSend().
+     *
+     * @return true if the transmit was dispatched (does not block for TX completion).
+     */
+    bool startSendRaw(const uint8_t *buf, size_t len);
+
+    /** Current channel utilization percent (0..100), sourced from the real airtime tracker.
+     *  Exposed for the MeshRoc native stack so its O4 ACK-timeout baseline matches reality. */
+    uint8_t currentChannelUtilization() const;
+
+    /** Current LoRa slot time in ms (contention-window unit). */
+    uint32_t currentSlotTimeMsec() const;
+
+    /** Register a sink for raw received frames. Only one sink is supported; passing
+     *  nullptr clears it. The MeshRoc bridge installs itself here. */
+    void setRawFrameSink(RawFrameSink sink, void *ctx) { rawSink_ = sink; rawSinkCtx_ = ctx; }
+
+    /** Register a sink for parsed meshtastic packets. Only one sink supported.
+     *  NOTE: payload is still encrypted at this point (decryption happens inside Router);
+     *  bridges needing plaintext must also hook the post-decrypt path. */
+    void setMeshtasticSink(MeshtasticFrameSink sink, void *ctx) { meshtasticSink_ = sink; meshtasticSinkCtx_ = ctx; }
 
     /**
      * Return true if we think the board can go to sleep (i.e. our tx queue is empty, we are not sending or receiving)

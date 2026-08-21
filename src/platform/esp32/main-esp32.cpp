@@ -13,7 +13,7 @@
 #define CAN_RELEASE_BT_MEMORY 1
 #endif
 
-#include <MeshtasticOTA.h>
+#include <MeshROCOTA.h>
 
 #if HAS_WIFI
 #include "mesh/wifi/WiFiAPClient.h"
@@ -261,16 +261,16 @@ void esp32Setup()
     preferences.end();
     LOG_DEBUG("Number of Device Reboots: %d", rebootCounter);
 #if !MESHTASTIC_EXCLUDE_WIFI
-    String version = MeshtasticOTA::getVersion();
+    String version = MeshROCOTA::getVersion();
     if (version.isEmpty()) {
-        LOG_INFO("MeshtasticOTA firmware not available");
+        LOG_INFO("MeshROCOTA firmware not available");
     } else {
-        LOG_INFO("MeshtasticOTA firmware version %s", version.c_str());
+        LOG_INFO("MeshROCOTA firmware version %s", version.c_str());
     }
-    MeshtasticOTA::initialize();
+    MeshROCOTA::initialize();
 #endif
 
-    // enableModemSleep();
+    enableModemSleep();
 
 // Since we are turning on watchdogs rather late in the release schedule, we really don't want to catch any
 // false positives.  The wait-to-sleep timeout for shutting down radios is 30 secs, so pick 45 for now.

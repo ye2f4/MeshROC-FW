@@ -6,6 +6,7 @@
 #include "main.h"
 #include "mesh/http/ContentHelper.h"
 #include "mesh/http/WebServer.h"
+#include "mesh/http/MeshRocHandlers.h"
 #if HAS_WIFI
 #include "mesh/wifi/WiFiAPClient.h"
 #endif
@@ -101,6 +102,7 @@ void registerHandlers(HTTPServer *insecureServer, HTTPSServer *secureServer)
     secureServer->registerNode(nodeJsonNodes);
     secureServer->registerNode(nodeAdmin);
     secureServer->registerNode(nodeRoot); // This has to be last
+    registerMeshRocHandlers(secureServer, secureServer);
 
     // Insecure nodes
     insecureServer->registerNode(nodeAPIv1ToRadioOptions);
@@ -115,6 +117,7 @@ void registerHandlers(HTTPServer *insecureServer, HTTPSServer *secureServer)
     insecureServer->registerNode(nodeJsonReport);
     insecureServer->registerNode(nodeAdmin);
     insecureServer->registerNode(nodeRoot); // This has to be last
+    registerMeshRocHandlers(insecureServer, insecureServer);
 }
 
 void handleAPIv1FromRadio(HTTPRequest *req, HTTPResponse *res)

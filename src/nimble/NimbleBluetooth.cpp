@@ -801,6 +801,8 @@ void NimbleBluetooth::startAdvertising()
     pAdvertising->reset();
 
     pAdvertising->addServiceUUID(MESH_SERVICE_UUID);
+    pAdvertising->setMinInterval(500);
+    pAdvertising->setMaxInterval(1000);
     // if (powerStatus->getHasBattery() == 1) {
     //     pAdvertising->addServiceUUID(BLEUUID((uint16_t)0x180f));
     // }
